@@ -74,7 +74,7 @@ if(SOLARI_BUILD_TESTS)
   # The cross-language wire contract the TS reference SDK regenerates. Passed as a
   # path because ctest's working directory is the build tree, not this one.
   target_compile_definitions(solari_tests PRIVATE
-    SOLARI_CONTRACT_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/sdk/ts-request-fixtures.json")
+    SOLARI_CONTRACT_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/ts-request-fixtures.json")
 
   enable_testing()
   add_test(NAME solari_tests COMMAND solari_tests)

@@ -10,6 +10,9 @@ REST) hands back a `solari::Sandbox` handle exposing
 - `.git` — `clone` / `status` / `add` / `commit` / `push` / `pull` / `checkout`
   / `branches` / `log`, composed client-side over `commands.run("git", …)`
 
+It behaves identically on the wire to the reference TypeScript
+(`@solarisdk/core`) SDK — see [`PROTOCOL.md`](PROTOCOL.md) for the contract.
+
 The API is **blocking and synchronous**. A background receive thread (inside the
 IXWebSocket transport) feeds a newline-delimited-JSON frame dispatcher; RPC calls
 block on a `std::future` until their correlated reply, and `commands.run` blocks
