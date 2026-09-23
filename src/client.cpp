@@ -16,11 +16,19 @@ nlohmann::json buildCreateBody(const CreateSandboxOptions& opts,
   if (!opts.envs.empty()) body["envs"] = opts.envs;
   if (!opts.metadata.empty()) body["metadata"] = opts.metadata;
   if (opts.timeoutMs) body["timeoutMs"] = *opts.timeoutMs;
+  if (opts.ttlSeconds) body["ttlSeconds"] = *opts.ttlSeconds;
   if (opts.fromSnapshot) body["fromSnapshot"] = *opts.fromSnapshot;
+  if (opts.isolation) body["isolation"] = *opts.isolation;
   if (opts.lifecycle) {
     nlohmann::json lc;
     lc["onTimeout"] = opts.lifecycle->onTimeout;
     if (opts.lifecycle->autoResume) lc["autoResume"] = *opts.lifecycle->autoResume;
+    if (opts.lifecycle->parkAfterMs) lc["parkAfterMs"] = *opts.lifecycle->parkAfterMs;
+    if (opts.lifecycle->parkMaxMs) lc["parkMaxMs"] = *opts.lifecycle->parkMaxMs;
+    if (opts.lifecycle->hibernateAfterParkedMs)
+      lc["hibernateAfterParkedMs"] = *opts.lifecycle->hibernateAfterParkedMs;
+    if (opts.lifecycle->checkpointEveryMs)
+      lc["checkpointEveryMs"] = *opts.lifecycle->checkpointEveryMs;
     body["lifecycle"] = lc;
   }
   if (opts.resolution) body["resolution"] = *opts.resolution;
@@ -138,6 +146,9 @@ SandboxView Client::get(const std::string& sandboxId) {
 }
 
 std::shared_ptr<Sandbox> Client::connect(const std::string& sandboxId) {
+  if (sandboxId.find_first_not_of(" \t\r\n\f\v") == std::string::npos) {
+    throw Error("Solari: connect() requires a non-blank sandbox id.");
+  }
   SandboxView view = get(sandboxId);
   CreateSandboxResponse resp;
   resp.sandboxId = view.sandboxId;

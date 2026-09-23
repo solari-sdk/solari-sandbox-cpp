@@ -737,3 +737,23 @@ TEST_CASE("Sandbox surfaces streamUrl for a desktop, none for a sandbox") {
   CHECK(sandbox.kind() == "sandbox");
   CHECK(sandbox.streamUrl().has_value() == false);
 }
+
+// A blank id builds a nearly-right "/sandboxes//exec" (double slash), so it is
+// rejected where it enters rather than surfacing as a malformed request.
+TEST_CASE("a blank session id is rejected at the boundary") {
+  // Guard A: the shared Sandbox ctor rejects a blank id from a response.
+  CreateSandboxResponse blank;
+  blank.sandboxId = "";
+  blank.controlUrl = "ws://127.0.0.1:1/control/";
+  CHECK_THROWS_AS(Sandbox(blank, SandboxConfig{}), Error);
+
+  CreateSandboxResponse okResp;
+  okResp.sandboxId = "sbx_1";
+  okResp.controlUrl = "ws://127.0.0.1:1/control/sbx_1";
+  CHECK_NOTHROW(Sandbox(okResp, SandboxConfig{}));
+
+  // Guard B: Client::connect() rejects a blank arg before any network call.
+  Client client(ClientOptions{"k", "http://127.0.0.1:1"});
+  CHECK_THROWS_AS(client.connect(""), Error);
+  CHECK_THROWS_AS(client.connect("   "), Error);
+}

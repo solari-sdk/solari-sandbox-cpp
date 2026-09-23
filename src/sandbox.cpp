@@ -48,7 +48,17 @@ Sandbox::Sandbox(const CreateSandboxResponse& resp, SandboxConfig config)
       apiKey_(config.apiKey),
       callTimeoutMs_(config.callTimeoutMs),
       hooks_(std::move(config.hooks)),
-      channel_(std::make_shared<ControlChannel>(config.callTimeoutMs)) {}
+      channel_(std::make_shared<ControlChannel>(config.callTimeoutMs)) {
+  // A blank id is the one bad value that survives to the wire looking almost
+  // right: it builds "/sandboxes//exec" (a double slash), not an obviously
+  // wrong path, so it goes unnoticed while every call the handle makes is
+  // malformed. Reject it where the handle is built. (Test blank, not absence.)
+  if (resp.sandboxId.find_first_not_of(" \t\r\n\f\v") == std::string::npos) {
+    throw Error(
+        "Solari: session id must not be blank - an empty id builds a malformed "
+        "/sandboxes// request.");
+  }
+}
 
 Sandbox::~Sandbox() { channel_->close(); }
 

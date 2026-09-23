@@ -192,6 +192,21 @@ struct Lifecycle {
   /** "pause" or "kill". */
   std::string onTimeout;
   std::optional<bool> autoResume;
+  /** Auto-park (deschedule) the guest after this many milliseconds with no
+   *  activity. Parking freezes vCPUs but keeps the slot, ports and control
+   *  channel resident, so the next request wakes it in milliseconds. Floored
+   *  by the gateway and capped at the session's idle window. */
+  std::optional<long> parkAfterMs;
+  /** Bounded park: the most a session may stay parked before the gateway
+   *  wakes it unconditionally, even with no incoming traffic. Floored at the
+   *  gateway's park floor and capped at the idle window. */
+  std::optional<long> parkMaxMs;
+  /** Escalate a session parked this long to a full hibernate (durable
+   *  checkpoint, slot freed) rather than staying frozen indefinitely. */
+  std::optional<long> hibernateAfterParkedMs;
+  /** Take a live durable checkpoint at most this often while the session
+   *  runs. Floored server-side. */
+  std::optional<long> checkpointEveryMs;
 };
 
 /** One attach-at-create instruction: a persistent volume and the absolute
@@ -213,7 +228,16 @@ struct CreateSandboxOptions {
   std::map<std::string, std::string> envs;
   std::map<std::string, std::string> metadata;
   std::optional<long> timeoutMs;
+  /** Legacy, gateway-side FALLBACK idle window in seconds, only used when
+   *  timeoutMs is unset — prefer timeoutMs. Kept for parity with the
+   *  reference SDKs, which have always accepted it. */
+  std::optional<long> ttlSeconds;
   std::optional<std::string> fromSnapshot;
+  /** VM isolation tier: "shared" (sandbox-only), "dedicated" (default) or
+   *  "hardened" (own VM, no outbound network — verified 2026-09-23 on
+   *  staging, not yet on prod; refused with 409 HostCapabilityMissing where
+   *  a host doesn't advertise it). */
+  std::optional<std::string> isolation;
   /** Idle lifecycle policy (pause/kill on timeout; optional auto-resume). */
   std::optional<Lifecycle> lifecycle;
   /** Initial display resolution, e.g. "1280x720". Desktops only — a headless

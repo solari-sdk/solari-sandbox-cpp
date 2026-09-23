@@ -229,10 +229,19 @@ CreateSandboxOptions maximalOptions() {
   o.envs = {{"FOO", "bar"}};
   o.metadata = {{"proj", "alpha"}};
   o.timeoutMs = 600000;
+  o.ttlSeconds = 3600;
   o.fromSnapshot = "snap_seed";
+  // Isolation is set per-op at each call site below (dedicated for the
+  // sandbox, hardened for the desktop, matching the TS reference exactly)
+  // rather than here -- "shared" is refused for desktops, so the two calls
+  // cannot share one isolation value.
   Lifecycle lc;
   lc.onTimeout = "pause";
   lc.autoResume = true;
+  lc.parkAfterMs = 30000;
+  lc.parkMaxMs = 20000;
+  lc.hibernateAfterParkedMs = 90000;
+  lc.checkpointEveryMs = 300000;
   o.lifecycle = lc;
   o.volumes = {VolumeAttachment{"vol_data", "/data"}};
   return o;
@@ -268,13 +277,19 @@ TEST_CASE("wire contract: every core op matches the reference SDK") {
   // THE OP TABLE. Every op the contract names must appear here, bound to the real
   // SDK call that performs it.
   std::map<std::string, std::function<void()>> ops = {
-      {"createSandbox", [&] { sb = client.create(maximalOptions()); }},
+      {"createSandbox",
+       [&] {
+         CreateSandboxOptions o = maximalOptions();
+         o.isolation = "dedicated";
+         sb = client.create(o);
+       }},
       {"createDesktop",
        [&] {
          CreateSandboxOptions o = maximalOptions();
          o.template_ = "default";
          o.resolution = "1280x720";
          o.record = true;
+         o.isolation = "hardened";
          auto d = client.createDesktop(o);
          d->close();
        }},
@@ -345,6 +360,8 @@ TEST_CASE("wire contract: buildCreateBody carries every create field") {
     CAPTURE(field);
     CHECK(body.contains(field));
   }
+  // isolation is asserted separately (below, on the desktop body) since
+  // maximalOptions() itself leaves it unset -- see the comment there.
   CHECK(body["lifecycle"]["onTimeout"] == "pause");
   CHECK(body["lifecycle"]["autoResume"] == true);
   CHECK(body["volumes"][0]["volumeId"] == "vol_data");
@@ -353,8 +370,10 @@ TEST_CASE("wire contract: buildCreateBody carries every create field") {
   CreateSandboxOptions o = maximalOptions();
   o.resolution = "1280x720";
   o.record = true;
+  o.isolation = "hardened";
   json d = buildCreateBody(o, SandboxKind::Desktop);
   CHECK(d["kind"] == "desktop");
   CHECK(d["resolution"] == "1280x720");
   CHECK(d["record"] == true);
+  CHECK(d["isolation"] == "hardened");
 }

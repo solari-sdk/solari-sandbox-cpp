@@ -156,8 +156,19 @@ nlohmann::json HttpTransport::request(
       } catch (...) {
         errBody = nlohmann::json();
       }
+      // 🚨 ALLOWLIST, NOT >= 500 — a 5xx is not automatically transient. The
+      // gateway's seven 501 sites (every /volumes route, permanently unavailable on
+      // GCP) were each retried 5x with backoff; the curve is visible in prod LB logs
+      // (04:47:11, +24s, +47s — doubling, which separates a retry loop from an
+      // evenly-spaced poll).
+      // 🪤 507 is named here rather than left to the retryable hint: the hint would
+      // cover it today, but that ties this SDK's correctness to which gateway build
+      // the caller reaches. 500 excluded (an unhandled error is not known-transient);
+      // 429 excluded as before.
+      const bool retryableStatus =
+          res.status == 502 || res.status == 503 || res.status == 504 || res.status == 507;
       bool retryable =
-          res.status >= 500 || (errBody.is_object() && errBody.contains("retryable") &&
+          retryableStatus || (errBody.is_object() && errBody.contains("retryable") &&
                                 errBody["retryable"].is_boolean() &&
                                 errBody["retryable"].get<bool>());
       if (idempotent && retryable && attempt < maxRetries_) {
