@@ -27,6 +27,8 @@ struct SessionHooks {
   std::function<void(const std::string& id)> pause;
   /** `POST /sandboxes/:id/resume` -> the control URL to re-attach to. */
   std::function<std::string(const std::string& id)> resume;
+  /** `POST /sandboxes/:id/start` -> the fresh control URL of the cold-booted sandbox. */
+  std::function<std::string(const std::string& id)> start;
 };
 
 struct SandboxConfig {
@@ -115,6 +117,14 @@ class Sandbox {
    * leaving the caller holding a resumed VM and a dead channel.
    */
   void resume();
+  /**
+   * Cold-boot this STOPPED session from the disk the host kept, adopt the fresh
+   * control URL, and reopen the control channel. Processes and memory are gone;
+   * files on disk are kept. Throws GatewayError (status 409, `code` set) when the
+   * sandbox is not stopped or its disk cannot be started; see Client::start().
+   * Throws when the handle has no start hook (a hand-built handle).
+   */
+  void start();
 
   /** Direct channel access (for the WS adapter and unit tests). */
   ControlChannel& channel() { return *channel_; }

@@ -187,6 +187,9 @@ class RecordingGateway {
       // control URL to re-attach to.
       return json({{"state", "running"}, {"controlUrl", kDeadControlUrl}}).dump();
     }
+    if (r.method == "POST" && endsWith(r.path, "/start")) {
+      return json({{"state", "running"}, {"controlUrl", kDeadControlUrl}}).dump();
+    }
     if (r.method == "GET" && r.path.rfind("/sandboxes/", 0) == 0) {
       return json({{"sandboxId", kCanonicalId},
                    {"kind", "sandbox"},
@@ -308,6 +311,16 @@ TEST_CASE("wire contract: every core op matches the reference SDK") {
          // control URL of the fresh slot.
          try {
            sb->resume();
+         } catch (const Error&) {
+           // expected: no WS server on the far end
+         }
+         CHECK(sb->controlUrl() == kDeadControlUrl);
+       }},
+      {"start",
+       [&] {
+         // Same limit as resume: no WS server, so only the hook + adopted URL.
+         try {
+           sb->start();
          } catch (const Error&) {
            // expected: no WS server on the far end
          }

@@ -92,6 +92,16 @@ SessionHooks Client::makeHooks() {
     }
     return http->wsOrigin() + "/control/" + encodeURIComponent(id);
   };
+  hooks.start = [http](const std::string& id) -> std::string {
+    nlohmann::json r =
+        http->request("POST", "/sandboxes/" + encodeURIComponent(id) + "/start");
+    // A cold boot lands on a fresh control URL; derive it as resume does if the
+    // gateway leaves it out.
+    if (r.is_object() && r.contains("controlUrl") && r["controlUrl"].is_string()) {
+      return r["controlUrl"].get<std::string>();
+    }
+    return http->wsOrigin() + "/control/" + encodeURIComponent(id);
+  };
   return hooks;
 }
 
@@ -177,6 +187,10 @@ void Client::pause(const std::string& sandboxId) { makeHooks().pause(sandboxId);
 
 std::string Client::resume(const std::string& sandboxId) {
   return makeHooks().resume(sandboxId);
+}
+
+std::string Client::start(const std::string& sandboxId) {
+  return makeHooks().start(sandboxId);
 }
 
 } // namespace solari
