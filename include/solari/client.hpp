@@ -46,6 +46,20 @@ class Client {
   /** Resume a paused session by id (`POST /sandboxes/:id/resume`); returns the
    *  control URL to re-attach to. */
   std::string resume(const std::string& sandboxId);
+  /** Cold-boot a STOPPED sandbox by id (`POST /sandboxes/:id/start`); returns the
+   *  fresh control URL to re-attach to. The guest powered itself off; this boots it
+   *  from the kept disk (processes and memory are gone, files are kept), takes a
+   *  concurrency slot (429 at the cap) and opens a new billing segment. Idempotent:
+   *  an already-running sandbox answers 200 and its current control URL.
+   *
+   *  GatewayError 409 `code`: NotStopped (use resume() for a paused one),
+   *  StartInProgress, StoppedDiskMissing, StoppedDiskUnsafe, GoldenMismatch,
+   *  DiskPlatformMismatch, DiskShaMismatch, DiskExceedsSpec, DiskOwnerMismatch, or
+   *  HostCapabilityMissing (host pool not armed; not retryable). 503 NoCapacity /
+   *  StartTimeout (NoCapacityError) and 502 StartHostError are retryable; 500
+   *  StartFailed is not, and leaves the sandbox stopped with its disk, so a later
+   *  start is safe. */
+  std::string start(const std::string& sandboxId);
 
   HttpTransport& http() { return *http_; }
 

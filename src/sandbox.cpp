@@ -102,6 +102,12 @@ void Sandbox::resume() {
   connect();
 }
 
+void Sandbox::start() {
+  if (!hooks_.start) throw Error("start requires a client-created handle");
+  controlUrl_ = hooks_.start(id_);
+  connect();
+}
+
 CommandHandle Sandbox::startCommand(const std::string& cmd,
                                     const CommandOptions& opts) {
   nlohmann::json params = {{"cmd", cmd}};
