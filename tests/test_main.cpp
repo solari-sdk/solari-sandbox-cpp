@@ -90,6 +90,50 @@ TEST_CASE("orphan async frames are buffered then flushed on registration") {
   CHECK(exit == 7);
 }
 
+TEST_CASE("orphan replay keeps order against a live frame that arrives mid-replay") {
+  // Regression: onFrame used to register the handler BEFORE replaying parked
+  // frames, so a live frame delivered by the rx thread during the replay could
+  // overtake them (stdout "worldhello "). Deterministic: the handler holds the
+  // replay open on its first call while the live frame is fed.
+  ControlChannel ch;
+  wire(ch);
+  auto frame = [](const char* b64) {
+    return std::string("{\"type\":\"cmd.data\",\"cmdId\":\"c3\",\"stream\":\"stdout\","
+                       "\"base64\":\"") + b64 + "\"}\n";
+  };
+  ch.onMessage(frame("YQ=="));  // "a", parked: no handler yet
+
+  std::mutex m;
+  std::condition_variable cv;
+  bool firstSeen = false, release = false;
+  int calls = 0;
+  std::string got;
+  std::thread reg([&] {
+    ch.onFrame("cmd.data", "c3", [&](const json& f) {
+      std::unique_lock<std::mutex> lk(m);
+      if (++calls == 1) {
+        firstSeen = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return release; });  // hold the replay open
+      }
+      got += base64Decode(f["base64"].get<std::string>());
+    });
+  });
+  {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&] { return firstSeen; });
+  }
+  ch.onMessage(frame("Yg=="));  // "b": live frame while the replay is in flight
+  {
+    std::lock_guard<std::mutex> lk(m);
+    release = true;
+  }
+  cv.notify_all();
+  reg.join();
+  std::lock_guard<std::mutex> lk(m);
+  CHECK(got == "ab");
+}
+
 TEST_CASE("onStreamClose after the channel is closed fires immediately") {
   // The registration race: a caller registers the stream closer AFTER the
   // cmd.start reply returns. If the channel tore down in that window, failAll()
