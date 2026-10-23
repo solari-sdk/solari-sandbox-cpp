@@ -194,19 +194,29 @@ nlohmann::json ControlChannel::call(const std::string& method,
 
 void ControlChannel::onFrame(const std::string& type, const std::string& id,
                              AsyncFrameHandler handler) {
-  std::vector<nlohmann::json> flush;
-  {
-    std::lock_guard<std::mutex> lk(mtx_);
-    frameHandlers_[type][id] = handler;
-    auto key = type + US + id;
-    auto it = orphanFrames_.find(key);
-    if (it != orphanFrames_.end()) {
+  // Replay frames that arrived before this handler existed (e.g. output packed
+  // into the same websocket message as the cmd.start reply) in arrival order,
+  // and register the handler only once nothing is left to replay. Registering
+  // first would let the rx thread deliver a newer live frame while an older
+  // parked one is still being replayed here, reordering the stream. Frames that
+  // arrive during a replay are parked again and drained by the next pass, so
+  // each is delivered exactly once and in order.
+  const auto key = type + US + id;
+  for (;;) {
+    std::vector<nlohmann::json> flush;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      auto it = orphanFrames_.find(key);
+      if (it == orphanFrames_.end()) {
+        frameHandlers_[type][id] = handler;
+        return;
+      }
       flush = std::move(it->second);
       orphanFrames_.erase(it);
       orphanCount_ -= flush.size();
     }
+    for (auto& f : flush) handler(f);  // outside the lock (may re-enter)
   }
-  for (auto& f : flush) handler(f);  // outside the lock
 }
 
 void ControlChannel::offFrame(const std::string& type, const std::string& id) {
