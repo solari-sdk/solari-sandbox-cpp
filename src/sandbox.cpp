@@ -1,5 +1,7 @@
 #include "solari/sandbox.hpp"
 
+#include <chrono>
+
 #include "solari/errors.hpp"
 #include "solari/util.hpp"
 
@@ -22,6 +24,13 @@ void CommandHandle::onData(
 }
 
 int CommandHandle::wait() { return st_->exitFut.get(); }
+
+std::optional<int> CommandHandle::waitFor(long timeoutMs) {
+  if (st_->exitFut.wait_for(std::chrono::milliseconds(timeoutMs)) != std::future_status::ready) {
+    return std::nullopt;
+  }
+  return st_->exitFut.get();
+}
 
 void CommandHandle::stdin_write(const std::string& data) {
   ch_->call("cmd.stdin", {{"cmdId", cmdId_}, {"base64", base64Encode(data)}},
@@ -110,6 +119,12 @@ void Sandbox::start() {
 
 CommandHandle Sandbox::startCommand(const std::string& cmd,
                                     const CommandOptions& opts) {
+  return startCommandTapped(cmd, opts, nullptr);
+}
+
+CommandHandle Sandbox::startCommandTapped(
+    const std::string& cmd, const CommandOptions& opts,
+    std::function<void(const std::string&, const std::string&)> tap) {
   nlohmann::json params = {{"cmd", cmd}};
   if (!opts.args.empty()) params["args"] = opts.args;
   if (opts.cwd) params["cwd"] = *opts.cwd;
@@ -130,6 +145,13 @@ CommandHandle Sandbox::startCommand(const std::string& cmd,
     }
   });
 
+  // Subscribed before the frame handlers below: registering them flushes frames that beat the
+  // cmd.start reply, and a non-empty subscriber list skips the replay buffer, so an accumulator
+  // attached later via onData() would lose that early output whenever a callback is set.
+  if (tap) {
+    std::lock_guard<std::mutex> lk(st->m);
+    st->cbs.push_back(std::move(tap));
+  }
   if (opts.onStdout || opts.onStderr) {
     std::lock_guard<std::mutex> lk(st->m);
     auto onOut = opts.onStdout;
@@ -198,14 +220,28 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
     }
   }
 
-  CommandHandle h = startCommand(cmd, opts);
   auto out = std::make_shared<std::string>();
   auto err = std::make_shared<std::string>();
-  h.onData([out, err](const std::string& stream, const std::string& data) {
-    if (stream == "stdout") *out += data;
-    else *err += data;
-  });
+  CommandHandle h = startCommandTapped(
+      cmd, opts, [out, err](const std::string& stream, const std::string& data) {
+        if (stream == "stdout") *out += data;
+        else *err += data;
+      });
   if (opts.background) return CommandResult{0, "", ""};
+  // timeoutMs is a deadline for the command, as on the REST /exec path: when it elapses the command
+  // is killed and the result is exit -1 with the output so far (the guest's own timeout result).
+  // Without this a hung command waited here forever.
+  if (opts.timeoutMs && *opts.timeoutMs > 0) {
+    std::optional<int> code = h.waitFor(*opts.timeoutMs);
+    if (!code) {
+      try {
+        h.kill(9);
+      } catch (const Error&) {
+      }
+      return CommandResult{-1, *out, *err};
+    }
+    return CommandResult{*code, *out, *err};
+  }
   int code = h.wait();
   return CommandResult{code, *out, *err};
 }
