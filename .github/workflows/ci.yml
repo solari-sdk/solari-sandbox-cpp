@@ -1,0 +1,28 @@
+name: CI
+
+# Offline build and tests only. No secrets, no network beyond the loopback mocks, nothing is published.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: C++
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ libcurl4-openssl-dev libssl-dev
+      - name: Configure
+        # CMake 4 rejects doctest 2.4.11's cmake_minimum_required < 3.5.
+        run: cmake -S . -B build -DSOLARI_BUILD_TESTS=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: ctest
+        run: ctest --test-dir build --output-on-failure
