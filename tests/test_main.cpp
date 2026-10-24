@@ -224,6 +224,107 @@ TEST_CASE("commands.run assembles {exitCode,stdout,stderr} from frames") {
   CHECK(result.stderr_ == "err");
 }
 
+// The guest can emit cmd.data / cmd.exit BEFORE the cmd.start reply is consumed (PROTOCOL.md section 2).
+// With onStdout/onStderr set, that early output must still be in the CommandResult.
+TEST_CASE("commands.run keeps output that beat the cmd.start reply when callbacks are set") {
+  CreateSandboxResponse resp;
+  resp.sandboxId = "sb";
+  resp.controlUrl = "ws://x/control/sb";
+  SandboxConfig cfg;
+  cfg.callTimeoutMs = 5000;
+  Sandbox sbx(resp, cfg);
+
+  std::mutex mm;
+  std::condition_variable cvv;
+  std::vector<json> sent;
+  sbx.channel().setSend([&](const std::string& s) {
+    std::lock_guard<std::mutex> lk(mm);
+    sent.push_back(json::parse(s));
+    cvv.notify_all();
+  });
+  sbx.channel().setConnected(true);
+
+  std::string cbOut, cbErr;
+  CommandResult result;
+  std::thread t([&] {
+    CommandOptions o;
+    o.onStdout = [&](const std::string& d) { cbOut += d; };
+    o.onStderr = [&](const std::string& d) { cbErr += d; };
+    result = sbx.commands.run("x", o);
+  });
+  {
+    std::unique_lock<std::mutex> lk(mm);
+    cvv.wait_for(lk, std::chrono::seconds(2), [&] { return !sent.empty(); });
+  }
+  REQUIRE(sent.size() == 1);
+  std::string id = sent[0]["id"].get<std::string>();
+
+  // One message: output + exit first (orphans: no handler yet), the reply last.
+  sbx.channel().onMessage(
+      "{\"type\":\"cmd.data\",\"cmdId\":\"c1\",\"stream\":\"stdout\",\"base64\":\"ZWFybHktb3V0Cg==\"}\n"
+      "{\"type\":\"cmd.data\",\"cmdId\":\"c1\",\"stream\":\"stderr\",\"base64\":\"ZWFybHktZXJyCg==\"}\n"
+      "{\"type\":\"cmd.exit\",\"cmdId\":\"c1\",\"exitCode\":3}\n"
+      "{\"id\":\"" + id + "\",\"ok\":true,\"result\":{\"cmdId\":\"c1\"}}\n");
+  t.join();
+  CHECK(result.exitCode == 3);
+  CHECK(result.stdout_ == "early-out\n");
+  CHECK(result.stderr_ == "early-err\n");
+  CHECK(cbOut == "early-out\n");
+  CHECK(cbErr == "early-err\n");
+}
+
+// timeoutMs is a command deadline on the WebSocket path too: the command is killed and the result is exit -1
+// with the output so far (it used to be honoured only by the REST /exec fast path).
+TEST_CASE("commands.run enforces timeoutMs on the WS path") {
+  CreateSandboxResponse resp;
+  resp.sandboxId = "sb";
+  resp.controlUrl = "ws://x/control/sb";
+  SandboxConfig cfg;
+  cfg.callTimeoutMs = 5000;
+  Sandbox sbx(resp, cfg);
+
+  std::mutex mm;
+  std::condition_variable cvv;
+  std::vector<json> sent;
+  sbx.channel().setSend([&](const std::string& s) {
+    std::lock_guard<std::mutex> lk(mm);
+    sent.push_back(json::parse(s));
+    cvv.notify_all();
+  });
+  sbx.channel().setConnected(true);
+
+  CommandResult result;
+  std::thread t([&] {
+    CommandOptions o;
+    o.timeoutMs = 80;
+    result = sbx.commands.run("sleep", o);
+  });
+  {
+    std::unique_lock<std::mutex> lk(mm);
+    cvv.wait_for(lk, std::chrono::seconds(2), [&] { return !sent.empty(); });
+  }
+  REQUIRE(sent.size() >= 1);
+  std::string id = sent[0]["id"].get<std::string>();
+  sbx.channel().onMessage(
+      "{\"id\":\"" + id + "\",\"ok\":true,\"result\":{\"cmdId\":\"c1\"}}\n"
+      "{\"type\":\"cmd.data\",\"cmdId\":\"c1\",\"stream\":\"stdout\",\"base64\":\"cGFydGlhbAo=\"}\n");
+  // The command never exits: run() must kill it after timeoutMs. Answer the cmd.kill RPC.
+  std::string killId;
+  {
+    std::unique_lock<std::mutex> lk(mm);
+    cvv.wait_for(lk, std::chrono::seconds(3), [&] { return sent.size() >= 2; });
+    REQUIRE(sent.size() >= 2);
+    CHECK(sent[1]["method"] == "cmd.kill");
+    CHECK(sent[1]["params"]["cmdId"] == "c1");
+    CHECK(sent[1]["params"]["signal"] == 9);
+    killId = sent[1]["id"].get<std::string>();
+  }
+  sbx.channel().onMessage("{\"id\":\"" + killId + "\",\"ok\":true,\"result\":{\"ok\":true}}\n");
+  t.join();
+  CHECK(result.exitCode == -1);
+  CHECK(result.stdout_ == "partial\n");
+}
+
 TEST_CASE("channel close wakes a command's exit-wait (no hang)") {
   CreateSandboxResponse resp;
   resp.sandboxId = "sb";
