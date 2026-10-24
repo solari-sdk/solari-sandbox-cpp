@@ -93,6 +93,10 @@ HttpTransport::RawResponse HttpTransport::perform(const PreparedRequest& req) {
   }
   struct curl_slist* headers = nullptr;
   for (const auto& h : req.headers) headers = curl_slist_append(headers, h.c_str());
+  // libcurl sends no Content-Length for a POST/PUT/PATCH without a body (CUSTOMREQUEST and no POSTFIELDS), and the hosted
+  // gateway's front end answers 411 Length Required (pause/resume/start). Say "empty body" explicitly.
+  if (!req.hasBody && (req.method == "POST" || req.method == "PUT" || req.method == "PATCH"))
+    headers = curl_slist_append(headers, "Content-Length: 0");
 
   curl_easy_setopt(curl, CURLOPT_URL, req.url.c_str());
   curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, req.method.c_str());

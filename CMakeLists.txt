@@ -69,7 +69,7 @@ if(SOLARI_BUILD_TESTS)
   )
   FetchContent_MakeAvailable(doctest)
 
-  add_executable(solari_tests tests/test_main.cpp tests/test_contract_wire.cpp tests/test_start.cpp)
+  add_executable(solari_tests tests/test_main.cpp tests/test_contract_wire.cpp tests/test_start.cpp tests/test_empty_post.cpp)
   target_link_libraries(solari_tests PRIVATE solari doctest::doctest)
   # The cross-language wire contract the TS reference SDK regenerates. Passed as a
   # path because ctest's working directory is the build tree, not this one.
