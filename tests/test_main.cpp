@@ -812,6 +812,58 @@ TEST_CASE("newIdempotencyKey looks like a v4 UUID") {
   CHECK(k[14] == '4');  // version nibble
 }
 
+
+// Gateway status + body code -> typed error (PROTOCOL.md section 4).
+TEST_CASE("throwGatewayError dispatches on the body code first") {
+  enum class K { Auth, Plan, Concurrency, NoCapacity, Plain };
+  struct C { const char* id; int status; const char* code; K kind; };
+  const C cases[] = {
+      {"401", 401, "Unauthorized", K::Auth},
+      {"402-plan", 402, "FeatureRequiresPlan", K::Plan},
+      {"402-credit", 402, "InsufficientCredit", K::Plan},
+      {"403-not-entitled", 403, "NotEntitled", K::Plan},
+      {"403-other", 403, "Forbidden", K::Plain},
+      {"404", 404, "NotFound", K::Plain},
+      {"409-sandbox-stopped", 409, "SandboxStopped", K::Plain},
+      {"410-gone", 410, "SandboxGone", K::Plain},
+      {"429-concurrency-cap", 429, "ConcurrencyLimitExceeded", K::Concurrency},
+      {"429-no-code", 429, "", K::Concurrency},
+      {"429-too-many-executions", 429, "TooManyExecutions", K::Plain},
+      {"429-object-limit", 429, "ObjectLimit", K::Plain},
+      {"500-internal", 500, "InternalError", K::Plain},
+      {"501-not-supported", 501, "NotSupported", K::Plain},
+      {"503-no-capacity", 503, "NoCapacity", K::NoCapacity},
+      {"503-start-timeout", 503, "StartTimeout", K::NoCapacity},
+      {"503-no-code", 503, "", K::NoCapacity},
+      {"503-sandbox-unavailable", 503, "SandboxUnavailable", K::Plain},
+      {"503-store-unavailable", 503, "StoreUnavailable", K::Plain},
+      {"503-admission-unavailable", 503, "AdmissionUnavailable", K::Plain},
+      {"503-dependency-unavailable", 503, "DependencyUnavailable", K::Plain},
+      {"507-insufficient-capacity", 507, "InsufficientCapacity", K::Plain},
+  };
+  for (const C& c : cases) {
+    INFO("errors/" << c.id);
+    json body = json::object();
+    if (std::string(c.code) != "") body["code"] = c.code;
+    bool threw = false;
+    try {
+      throwGatewayError(c.status, body);
+    } catch (const GatewayError& e) {
+      threw = true;
+      CHECK(e.status == c.status);  // the status the gateway sent is kept
+      if (std::string(c.code) != "") {
+        REQUIRE(e.code.has_value());
+        CHECK(*e.code == c.code);
+      }
+      CHECK((dynamic_cast<const AuthError*>(&e) != nullptr) == (c.kind == K::Auth));
+      CHECK((dynamic_cast<const PlanError*>(&e) != nullptr) == (c.kind == K::Plan));
+      CHECK((dynamic_cast<const ConcurrencyLimitError*>(&e) != nullptr) == (c.kind == K::Concurrency));
+      CHECK((dynamic_cast<const NoCapacityError*>(&e) != nullptr) == (c.kind == K::NoCapacity));
+    }
+    CHECK(threw);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // errors mapping
 // ---------------------------------------------------------------------------

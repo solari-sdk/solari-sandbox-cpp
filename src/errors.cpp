@@ -15,20 +15,31 @@ static std::string pickMessage(const nlohmann::json& body, int status) {
 
 void throwGatewayError(int status, const nlohmann::json& body) {
   std::string msg = pickMessage(body, status);
+  // `code` is the discriminator (PROTOCOL.md section 4); the status alone is not
+  // enough because one status carries several meanings. A response with no code keeps
+  // the type its status has always had.
+  std::string code;
+  if (body.is_object() && body.contains("code") && body["code"].is_string()) {
+    code = body["code"].get<std::string>();
+  }
   switch (status) {
     case 401:
-    case 403:
       throw AuthError(msg, body);
     case 402:
       throw PlanError(msg, body);
+    case 403:
+      // The gateway's only JSON 403 is NotEntitled (the plan does not include sandboxes/desktops).
+      if (code == "NotEntitled") throw PlanError(msg, body, 403);
+      throw GatewayError(403, msg, body);
     case 429:
-      throw ConcurrencyLimitError(msg, body);
+      if (code.empty() || code == "ConcurrencyLimitExceeded") throw ConcurrencyLimitError(msg, body);
+      throw GatewayError(429, msg, body);
     case 503:
-      throw NoCapacityError(msg, body);
+      if (code.empty() || code == "NoCapacity" || code == "StartTimeout") throw NoCapacityError(msg, body);
+      throw GatewayError(503, msg, body);
     default:
       // body-level `no_capacity` also maps to NoCapacityError.
-      if (body.is_object() && body.contains("code") && body["code"].is_string() &&
-          body["code"].get<std::string>() == "no_capacity") {
+      if (code == "no_capacity") {
         throw NoCapacityError(msg, body);
       }
       throw GatewayError(status, msg, body);
