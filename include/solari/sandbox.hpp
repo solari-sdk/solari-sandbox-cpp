@@ -62,6 +62,8 @@ class CommandHandle {
   void onData(std::function<void(const std::string& stream, const std::string& data)> cb);
   /** Block until the command exits; returns its exit code. Throws on channel drop. */
   int wait();
+  /** Like wait(), but gives up after `timeoutMs`: returns the exit code, or nullopt on timeout. */
+  std::optional<int> waitFor(long timeoutMs);
   /** Write bytes to the command's stdin. */
   void stdin_write(const std::string& data);
   /** Send a signal (0 => server default). */
@@ -132,6 +134,15 @@ class Sandbox {
   // --- primitives -----------------------------------------------------------
   CommandResult runCommand(const std::string& cmd, const CommandOptions& opts = {});
   CommandHandle startCommand(const std::string& cmd, const CommandOptions& opts = {});
+
+ private:
+  // Internal: `tap` is subscribed before any frame handler is registered, so output that beat
+  // the cmd.start reply reaches it as well as the caller's callbacks (see runCommand).
+  CommandHandle startCommandTapped(
+      const std::string& cmd, const CommandOptions& opts,
+      std::function<void(const std::string&, const std::string&)> tap);
+
+ public:
   RunCodeResult runCode(const std::string& code, const RunCodeOptions& opts = {});
 
   // --- namespaced accessors -------------------------------------------------
