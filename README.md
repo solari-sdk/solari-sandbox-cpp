@@ -143,8 +143,8 @@ All failures throw exceptions derived from `solari::Error` (which is a
 `std::runtime_error`):
 
 - `GatewayError` (with `status` / `code` / `body`) and its typed subclasses
-  `AuthError` (401/403), `PlanError` (402), `ConcurrencyLimitError` (429),
-  `NoCapacityError` (503)
+  `AuthError` (401), `PlanError` (402, or 403 `NotEntitled`), `ConcurrencyLimitError` (429 `ConcurrencyLimitExceeded`),
+  `NoCapacityError` (503 `NoCapacity` / `StartTimeout`); other 403/429/503 codes are a plain `GatewayError`
 - `ActionError` (an RPC replied `ok:false`), `TimeoutError`, `ConnectionError`
 
 ## Testing

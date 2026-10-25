@@ -30,7 +30,7 @@ class GatewayError : public Error {
   }
 };
 
-/** HTTP 401/403 — missing/rejected API key. */
+/** HTTP 401 — missing/rejected API key. */
 class AuthError : public GatewayError {
  public:
   explicit AuthError(const std::string& msg = "Invalid or missing API key",
@@ -38,15 +38,23 @@ class AuthError : public GatewayError {
       : GatewayError(401, msg, std::move(b)) {}
 };
 
-/** HTTP 402 — the plan doesn't allow this. */
+/**
+ * The plan doesn't allow this: HTTP 402 (FeatureRequiresPlan, InsufficientCredit) or
+ * 403 {code:"NotEntitled"} (the plan does not include sandboxes/desktops). `status` is
+ * the status the gateway really sent (402 unless a 403 NotEntitled built it).
+ */
 class PlanError : public GatewayError {
  public:
   explicit PlanError(const std::string& msg = "This feature requires a different plan",
-                     nlohmann::json b = nlohmann::json())
-      : GatewayError(402, msg, std::move(b)) {}
+                     nlohmann::json b = nlohmann::json(), int status = 402)
+      : GatewayError(status, msg, std::move(b)) {}
 };
 
-/** HTTP 429 — org is at its session cap. NOT retryable. */
+/**
+ * HTTP 429 {code:"ConcurrencyLimitExceeded"} (or a 429 with no code) — org is at its
+ * session cap. NOT retryable. Other 429s (TooManyExecutions, a per-sandbox limit,
+ * ObjectLimit, the template caps) are plain GatewayError with the gateway's code.
+ */
 class ConcurrencyLimitError : public GatewayError {
  public:
   explicit ConcurrencyLimitError(const std::string& msg = "Concurrency limit exceeded",
@@ -54,7 +62,13 @@ class ConcurrencyLimitError : public GatewayError {
       : GatewayError(429, msg, std::move(b)) {}
 };
 
-/** HTTP 503 / body `no_capacity` — no host available (retryable). */
+/**
+ * HTTP 503 {code:"NoCapacity"|"StartTimeout"} (or a 503 with no code) / body
+ * `no_capacity` — no host available (retryable). Other 503s (SandboxUnavailable,
+ * StoreUnavailable, AdmissionUnavailable, DependencyUnavailable) are plain
+ * GatewayError: the sandbox, store or admission service is unavailable, which is not a
+ * capacity problem.
+ */
 class NoCapacityError : public GatewayError {
  public:
   explicit NoCapacityError(const std::string& msg = "No host available",
