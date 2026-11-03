@@ -51,6 +51,7 @@ static CommandResult parseCommandResult(const nlohmann::json& j) {
     r.stdout_ = j["stdout"].get<std::string>();
   if (j.contains("stderr") && j["stderr"].is_string())
     r.stderr_ = j["stderr"].get<std::string>();
+  if (j.contains("timedOut") && j["timedOut"].is_boolean()) r.timedOut = j["timedOut"].get<bool>();
   return r;
 }
 
@@ -136,6 +137,8 @@ std::shared_ptr<Sandbox> Client::createWithKind(const CreateSandboxOptions& opts
     resp.expiresAt = r["expiresAt"].get<std::string>();
   if (r.contains("streamUrl") && r["streamUrl"].is_string())
     resp.streamUrl = r["streamUrl"].get<std::string>();
+  if (r.contains("recordingUrl") && r["recordingUrl"].is_string())
+    resp.recordingUrl = r["recordingUrl"].get<std::string>();
 
   return std::make_shared<Sandbox>(resp, handleConfig());
 }

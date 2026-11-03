@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -167,6 +168,56 @@ TEST_CASE("non-JSON lines are ignored, not fatal") {
   ch.onFrame("cmd.data", "c9", [&](const json&) { called = true; });
   ch.onMessage("not json at all\n\n   \n");
   CHECK_FALSE(called);
+}
+
+// ---------------------------------------------------------------------------
+// commands.run one-shot: a JSON 404 is a gateway answer, not "route unavailable"; timedOut and recordingUrl are kept
+// ---------------------------------------------------------------------------
+static Sandbox sandboxWithExec(std::function<CommandResult(const std::string&, const ExecOneShotRequest&)> exec) {
+  CreateSandboxResponse resp;
+  resp.sandboxId = "sb";
+  resp.controlUrl = "ws://127.0.0.1:1/control/sb";
+  resp.recordingUrl = "https://rec.example/r/1";
+  SandboxConfig cfg;
+  cfg.callTimeoutMs = 200;
+  cfg.hooks.exec = std::move(exec);
+  return Sandbox(resp, cfg);
+}
+
+TEST_CASE("a JSON 404 from /exec reaches the caller instead of falling back to the control channel") {
+  Sandbox sbx = sandboxWithExec([](const std::string&, const ExecOneShotRequest&) -> CommandResult {
+    throw GatewayError(404, "Not found", json{{"error", "Not found"}});
+  });
+  CHECK_THROWS_AS(sbx.commands.run("true"), GatewayError);
+}
+
+TEST_CASE("a plain-text 404 (route not served) still falls back to the control channel") {
+  Sandbox sbx = sandboxWithExec([](const std::string&, const ExecOneShotRequest&) -> CommandResult {
+    throw GatewayError(404, "Gateway request failed with status 404", json());
+  });
+  // The fallback needs a control channel, which this handle does not have: whatever it throws, it is not the 404.
+  bool gateway404 = false;
+  try {
+    sbx.commands.run("true");
+  } catch (const GatewayError&) {
+    gateway404 = true;
+  } catch (...) {
+  }
+  CHECK_FALSE(gateway404);
+}
+
+TEST_CASE("timedOut survives the one-shot result; recordingUrl reaches the handle") {
+  Sandbox sbx = sandboxWithExec([](const std::string&, const ExecOneShotRequest&) {
+    CommandResult r;
+    r.exitCode = -1;
+    r.timedOut = true;
+    return r;
+  });
+  CommandResult r = sbx.commands.run("sleep", {});
+  CHECK(r.timedOut);
+  CHECK(r.exitCode == -1);
+  REQUIRE(sbx.recordingUrl().has_value());
+  CHECK(*sbx.recordingUrl() == "https://rec.example/r/1");
 }
 
 // ---------------------------------------------------------------------------
@@ -477,12 +528,13 @@ struct GitCall {
   std::string cmd;
   std::vector<std::string> args;
   std::optional<std::string> cwd;
+  std::map<std::string, std::string> env;
 };
 
 TEST_CASE("git.status parses branch, ahead/behind, staged/modified/untracked") {
   std::vector<GitCall> calls;
   GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
-    calls.push_back({cmd, o.args, o.cwd});
+    calls.push_back({cmd, o.args, o.cwd, o.env});
     if (!o.args.empty() && o.args[0] == "status")
       return {0,
               "## main...origin/main [ahead 2, behind 1]\n"
@@ -531,7 +583,7 @@ TEST_CASE("git.status handles a fresh repo with no commits") {
 TEST_CASE("git.branches parses name/commit/current from the stable format") {
   std::vector<GitCall> calls;
   GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
-    calls.push_back({cmd, o.args, o.cwd});
+    calls.push_back({cmd, o.args, o.cwd, o.env});
     if (!o.args.empty() && o.args[0] == "branch")
       return {0, "*\037main\037abc1234\n \037dev\037def5678\n", ""};
     return {0, "", ""};
@@ -571,7 +623,7 @@ TEST_CASE("git.log parses unit-separated commit records") {
 TEST_CASE("git.commit sets identity, then resolves the new hash") {
   std::vector<GitCall> calls;
   GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
-    calls.push_back({cmd, o.args, o.cwd});
+    calls.push_back({cmd, o.args, o.cwd, o.env});
     bool hasRevParse = false;
     for (const auto& a : o.args)
       if (a == "rev-parse") hasRevParse = true;
@@ -595,10 +647,16 @@ TEST_CASE("git.commit sets identity, then resolves the new hash") {
                                  "commit", "-m", "msg", "-a"});
 }
 
-TEST_CASE("git.clone injects basic-auth creds into the https remote") {
+static bool argvHas(const std::vector<std::string>& args, const std::string& needle) {
+  for (const auto& a : args)
+    if (a.find(needle) != std::string::npos) return true;
+  return false;
+}
+
+TEST_CASE("git.clone sends credentials by env + an origin-bound helper, never in the URL or argv") {
   std::vector<GitCall> calls;
   GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
-    calls.push_back({cmd, o.args, o.cwd});
+    calls.push_back({cmd, o.args, o.cwd, o.env});
     return {0, "", ""};
   });
   GitCloneOptions opts;
@@ -610,26 +668,74 @@ TEST_CASE("git.clone injects basic-auth creds into the https remote") {
   opts.cwd = "/work";
   g.clone("https://github.com/acme/repo.git", opts);
   REQUIRE(calls.size() == 1);
+  const auto& a = calls[0].args;
   CHECK(calls[0].cwd.value() == "/work");
-  std::vector<std::string> head(calls[0].args.begin(), calls[0].args.begin() + 5);
-  CHECK(head == std::vector<std::string>{"clone", "--depth", "1", "--branch", "main"});
-  const std::string& url = calls[0].args[5];
-  CHECK(url.rfind("https://u:p%40ss%20word@github.com/", 0) == 0);
-  CHECK(calls[0].args[6] == "dest");
+  CHECK(a[0] == "-c");
+  CHECK(a[1] == "credential.helper=");
+  CHECK(a[2] == "-c");
+  CHECK(a[3].rfind("credential.https://github.com.helper=!f()", 0) == 0);
+  CHECK(std::vector<std::string>(a.begin() + 4, a.end()) ==
+        std::vector<std::string>{"clone", "--depth", "1", "--branch", "main", "--",
+                                 "https://github.com/acme/repo.git", "dest"});
+  CHECK(calls[0].env.at("SOLARI_GIT_USERNAME") == "u");
+  CHECK(calls[0].env.at("SOLARI_GIT_PASSWORD") == "p@ss word");
+  CHECK(calls[0].env.at("GIT_TERMINAL_PROMPT") == "0");
+  CHECK_FALSE(argvHas(a, "p@ss"));
+  CHECK_FALSE(argvHas(a, "p%40ss"));
+  CHECK_FALSE(argvHas(a, "u:"));
 }
 
-TEST_CASE("GitOps::authUrl encodes userinfo") {
-  CHECK(GitOps::authUrl("https://github.com/acme/repo.git", "u", "p@ss word")
-            .rfind("https://u:p%40ss%20word@github.com/", 0) == 0);
-  // scp-style / no scheme -> unchanged
-  CHECK(GitOps::authUrl("git@github.com:acme/repo.git", "u", "p") ==
-        "git@github.com:acme/repo.git");
+TEST_CASE("git.clone puts -- before a user URL and sends no helper without creds") {
+  std::vector<GitCall> calls;
+  GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
+    calls.push_back({cmd, o.args, o.cwd, o.env});
+    return {0, "", ""};
+  });
+  GitCloneOptions opts;
+  opts.path = "dest";
+  g.clone("--upload-pack=touch /tmp/pwned", opts);
+  CHECK(calls[0].args ==
+        std::vector<std::string>{"clone", "--", "--upload-pack=touch /tmp/pwned", "dest"});
+  CHECK(calls[0].env.empty());
+}
+
+TEST_CASE("git credentials with line breaks are refused; the password is masked in errors") {
+  GitOps g([&](const std::string&, const CommandOptions&) -> CommandResult { return {0, "", ""}; });
+  GitCloneOptions bad;
+  bad.username = "u";
+  bad.password = std::string("a\nurl=https://evil");
+  CHECK_THROWS_AS(g.clone("https://h/r.git", bad), Error);
+  GitOps g2([&](const std::string&, const CommandOptions&) -> CommandResult {
+    return {128, "", "fatal: unable to access: hunter2 rejected"};
+  });
+  GitCloneOptions ok;
+  ok.username = "u";
+  ok.password = "hunter2";
+  try {
+    g2.clone("https://h/r.git", ok);
+    FAIL("expected a throw");
+  } catch (const Error& e) {
+    std::string m = e.what();
+    CHECK(m.find("git clone failed") != std::string::npos);
+    CHECK(m.find("hunter2") == std::string::npos);
+  }
+}
+
+TEST_CASE("GitOps::authFor binds the helper to the origin and ignores ssh remotes") {
+  auto a = GitOps::authFor("https://git.example.com:8443/acme/repo.git", "u", "p");
+  REQUIRE(a.ok);
+  CHECK(a.cfg[3].rfind("credential.https://git.example.com:8443.helper=!f()", 0) == 0);
+  CHECK_FALSE(GitOps::authFor("git@github.com:acme/repo.git", "u", "p").ok);
+  CHECK_FALSE(GitOps::authFor("https://github.com/x.git", "", "").ok);
+  // Userinfo already in the URL is not part of the origin.
+  CHECK(GitOps::authFor("https://old:cred@github.com/x.git", "u", "p").cfg[3].rfind(
+            "credential.https://github.com.helper=", 0) == 0);
 }
 
 TEST_CASE("git.add is a no-op on empty paths and uses -- separator otherwise") {
   std::vector<GitCall> calls;
   GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
-    calls.push_back({cmd, o.args, o.cwd});
+    calls.push_back({cmd, o.args, o.cwd, o.env});
     return {0, "", ""};
   });
   g.add({});
@@ -656,49 +762,59 @@ TEST_CASE("git surfaces a non-zero exit as an error with stderr") {
   CHECK(threw);
 }
 
-TEST_CASE("git.push builds a one-off authed insteadOf remote") {
+TEST_CASE("git.push resolves the remote URL, binds the helper to its origin, keeps the secret out of argv") {
   std::vector<GitCall> calls;
   GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
-    calls.push_back({cmd, o.args, o.cwd});
-    if (o.args.size() >= 2 && o.args[0] == "remote" && o.args[1] == "get-url")
-      return {0, "https://github.com/acme/repo.git\n", ""};
+    calls.push_back({cmd, o.args, o.cwd, o.env});
+    if (!o.args.empty() && o.args[0] == "remote")
+      return {0, "https://git.example.com:8443/acme/repo.git\n", ""};
     return {0, "", ""};
   });
   GitRemoteOptions opts;
   opts.username = "u";
   opts.password = "tok";
   opts.cwd = "/repo";
+  opts.branch = "main";
   g.push(opts);
-  // Last call is the push with the -c url.<authed>.insteadOf=<plain> prefix.
-  const GitCall& push = calls.back();
-  REQUIRE(push.args.size() >= 4);
-  CHECK(push.args[0] == "-c");
-  CHECK(push.args[1].rfind("url.https://u:tok@github.com/acme/repo.git.insteadOf="
-                           "https://github.com/acme/repo.git",
-                           0) == 0);
-  CHECK(push.args[2] == "push");
-  CHECK(push.args[3] == "origin");
+  REQUIRE(calls.size() == 2);
+  CHECK(calls[0].args == std::vector<std::string>{"remote", "get-url", "--", "origin"});
+  CHECK(calls[0].env.empty());
+  const auto& push = calls[1].args;
+  CHECK(push[0] == "-c");
+  CHECK(push[1] == "credential.helper=");
+  CHECK(push[3].rfind("credential.https://git.example.com:8443.helper=!f()", 0) == 0);
+  CHECK(std::vector<std::string>(push.begin() + 4, push.end()) ==
+        std::vector<std::string>{"push", "--", "origin", "main"});
+  CHECK(calls[1].env.at("SOLARI_GIT_PASSWORD") == "tok");
+  CHECK_FALSE(argvHas(push, "tok"));
 }
 
-TEST_CASE("git.push without creds skips the remote-url rewrite") {
+TEST_CASE("git.push without creds is a plain push; an ssh remote gets no helper") {
   std::vector<GitCall> calls;
   GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
-    calls.push_back({cmd, o.args, o.cwd});
+    calls.push_back({cmd, o.args, o.cwd, o.env});
+    if (!o.args.empty() && o.args[0] == "remote") return {0, "git@github.com:acme/repo.git\n", ""};
     return {0, "", ""};
   });
   GitRemoteOptions opts;
   opts.cwd = "/repo";
   g.push(opts);
-  // No `remote get-url` leg — just the push itself.
   REQUIRE(calls.size() == 1);
-  CHECK(calls[0].args[0] == "push");
-  CHECK(calls[0].args[1] == "origin");
+  CHECK(calls[0].args == std::vector<std::string>{"push", "--", "origin"});
+  CHECK(calls[0].env.empty());
+  GitRemoteOptions withCreds = opts;
+  withCreds.username = "u";
+  withCreds.password = "p";
+  g.pull(withCreds);
+  REQUIRE(calls.size() == 3);
+  CHECK(calls[2].args == std::vector<std::string>{"pull", "--", "origin"});
+  CHECK(calls[2].env.empty());
 }
 
 TEST_CASE("git.pull shares the auth path with op=pull and a custom remote") {
   std::vector<GitCall> calls;
   GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
-    calls.push_back({cmd, o.args, o.cwd});
+    calls.push_back({cmd, o.args, o.cwd, o.env});
     if (!o.args.empty() && o.args[0] == "remote")
       return {0, "https://github.com/acme/repo.git\n", ""};
     return {0, "", ""};
@@ -708,34 +824,44 @@ TEST_CASE("git.pull shares the auth path with op=pull and a custom remote") {
   opts.username = "u";
   opts.password = "p";
   g.pull(opts);
-  CHECK(calls[0].args[0] == "remote");
-  CHECK(calls[0].args[1] == "get-url");
-  CHECK(calls[0].args[2] == "upstream");
-  const GitCall& pull = calls.back();
-  CHECK(pull.args[0] == "-c");
-  CHECK(pull.args[2] == "pull");
-  CHECK(pull.args[3] == "upstream");
+  CHECK(calls[0].args == std::vector<std::string>{"remote", "get-url", "--", "upstream"});
+  const auto& pull = calls.back().args;
+  CHECK(std::vector<std::string>(pull.begin() + 4, pull.end()) ==
+        std::vector<std::string>{"pull", "--", "upstream"});
+  CHECK(calls.back().env.at("SOLARI_GIT_USERNAME") == "u");
+}
+
+TEST_CASE("git push/pull/checkout refuse option-like remotes, branches and refs") {
+  int ran = 0;
+  GitOps g([&](const std::string&, const CommandOptions&) -> CommandResult {
+    ++ran;
+    return {0, "", ""};
+  });
+  GitRemoteOptions r1;
+  r1.remote = "--receive-pack=x";
+  CHECK_THROWS_AS(g.push(r1), Error);
+  GitRemoteOptions r2;
+  r2.branch = "--rebase";
+  CHECK_THROWS_AS(g.pull(r2), Error);
+  CHECK_THROWS_AS(g.checkout("--orphan=x"), Error);
+  CHECK(ran == 0);
 }
 
 TEST_CASE("git.checkout switches refs; create adds -b") {
   std::vector<GitCall> calls;
   GitOps g([&](const std::string& cmd, const CommandOptions& o) -> CommandResult {
-    calls.push_back({cmd, o.args, o.cwd});
+    calls.push_back({cmd, o.args, o.cwd, o.env});
     return {0, "", ""};
   });
   GitCheckoutOptions co;
   co.cwd = "/repo";
   g.checkout("dev", co);
-  CHECK(calls[0].args.size() == 2);
-  CHECK(calls[0].args[0] == "checkout");
-  CHECK(calls[0].args[1] == "dev");
+  CHECK(calls[0].args == std::vector<std::string>{"checkout", "dev", "--"});
   GitCheckoutOptions cc;
   cc.cwd = "/repo";
   cc.create = true;
   g.checkout("feature", cc);
-  CHECK(calls[1].args[0] == "checkout");
-  CHECK(calls[1].args[1] == "-b");
-  CHECK(calls[1].args[2] == "feature");
+  CHECK(calls[1].args == std::vector<std::string>{"checkout", "-b", "feature", "--"});
 }
 
 // ---------------------------------------------------------------------------
