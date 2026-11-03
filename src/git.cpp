@@ -8,54 +8,95 @@
 namespace solari {
 
 static CommandOptions optsWith(const std::vector<std::string>& args,
-                               const std::optional<std::string>& cwd) {
+                               const std::optional<std::string>& cwd,
+                               const std::map<std::string, std::string>& env) {
   CommandOptions o;
   o.args = args;
   if (cwd) o.cwd = cwd;
+  o.env = env;
   return o;
 }
 
+/** The git subcommand in an argv that may start with `-c k=v` pairs. */
+static std::string gitSubcommand(const std::vector<std::string>& args) {
+  std::size_t i = 0;
+  while (i + 1 < args.size() && args[i] == "-c") i += 2;
+  return i < args.size() ? args[i] : "";
+}
+
+/** User text that begins with "-" would be parsed by git as an option. */
+static void rejectOptionLike(const char* what, const std::string& v) {
+  if (!v.empty() && v[0] == '-')
+    throw Error(std::string("git ") + what + " must not start with \"-\": " + v);
+}
+
 CommandResult GitOps::runGit(const std::vector<std::string>& args,
-                             std::optional<std::string> cwd) {
-  return run_("git", optsWith(args, cwd));
+                             std::optional<std::string> cwd,
+                             const std::map<std::string, std::string>& env) {
+  return run_("git", optsWith(args, cwd, env));
 }
 
 std::string GitOps::mustGit(const std::vector<std::string>& args,
-                            std::optional<std::string> cwd) {
-  CommandResult r = runGit(args, cwd);
+                            std::optional<std::string> cwd,
+                            const std::map<std::string, std::string>& env,
+                            const std::string& secret) {
+  CommandResult r = runGit(args, cwd, env);
   if (r.exitCode != 0) {
     std::string detail = trim(!r.stderr_.empty() ? r.stderr_ : r.stdout_);
-    std::string sub = args.empty() ? "" : args[0];
-    throw Error("git " + sub + " failed (exit " + std::to_string(r.exitCode) +
-                "): " + detail);
+    if (!secret.empty()) {
+      std::size_t pos = 0;
+      while ((pos = detail.find(secret, pos)) != std::string::npos) {
+        detail.replace(pos, secret.size(), "***");
+        pos += 3;
+      }
+    }
+    throw Error("git " + gitSubcommand(args) + " failed (exit " +
+                std::to_string(r.exitCode) + "): " + detail);
   }
   return r.stdout_;
 }
 
-// Splice basic-auth into an https-style remote URL. Mirrors `new URL()` +
-// encodeURIComponent(user/pass): "p@ss word" -> "p%40ss%20word". On any parse
-// failure (ssh/scp-style, no scheme) the URL is returned unchanged.
-std::string GitOps::authUrl(const std::string& url, const std::string& username,
-                            const std::string& password) {
-  if (username.empty() && password.empty()) return url;
-  auto pos = url.find("://");
-  if (pos == std::string::npos) return url;
-  std::string scheme = url.substr(0, pos);
-  std::string rest = url.substr(pos + 3);
+// Inline git credential helper: answers `get` from the command's environment, ignores `store` / `erase`, and holds
+// no secret.
+static const char* kCredentialHelper =
+    "!f() { test \"$1\" = get && printf \"username=%s\\npassword=%s\\n\" "
+    "\"$SOLARI_GIT_USERNAME\" \"$SOLARI_GIT_PASSWORD\"; }; f";
+
+GitOps::Auth GitOps::authFor(const std::string& remoteUrl, const std::string& username,
+                             const std::string& password) {
+  Auth a;
+  if (username.empty() && password.empty()) return a;
+  auto hasBad = [](const std::string& v) {
+    return v.find_first_of(std::string("\r\n\0", 3)) != std::string::npos;
+  };
+  if (hasBad(username) || hasBad(password))
+    throw Error("git credentials must not contain line breaks or NUL");
+  auto pos = remoteUrl.find("://");
+  if (pos == std::string::npos) return a;  // scp-style or malformed: not an http(s) remote
+  std::string scheme = remoteUrl.substr(0, pos);
+  if (scheme != "http" && scheme != "https") return a;
+  std::string rest = remoteUrl.substr(pos + 3);
   auto e = rest.find_first_of("/?#");
   std::string authority = (e == std::string::npos) ? rest : rest.substr(0, e);
-  std::string tail = (e == std::string::npos) ? "" : rest.substr(e);
-  // Drop any existing userinfo.
-  auto at = authority.find('@');
+  auto at = authority.rfind('@');
   std::string host = (at == std::string::npos) ? authority : authority.substr(at + 1);
-  std::string userinfo;
-  if (!username.empty()) userinfo += encodeURIComponent(username);
-  if (!password.empty()) userinfo += ":" + encodeURIComponent(password);
-  return scheme + "://" + userinfo + "@" + host + tail;
+  if (host.empty() || host.find_first_of("= \t\r\n") != std::string::npos) return a;
+  std::string origin = scheme + "://" + host;
+  a.ok = true;
+  // The empty value first clears any helper configured on the guest, so only ours answers...
+  a.cfg = {"-c", "credential.helper=",
+           // ...and only for this origin.
+           "-c", "credential." + origin + ".helper=" + kCredentialHelper};
+  a.env = {{"GIT_TERMINAL_PROMPT", "0"},
+           {"SOLARI_GIT_USERNAME", username},
+           {"SOLARI_GIT_PASSWORD", password}};
+  return a;
 }
 
 void GitOps::clone(const std::string& url, const GitCloneOptions& opts) {
-  std::vector<std::string> args = {"clone"};
+  Auth auth = authFor(url, opts.username.value_or(""), opts.password.value_or(""));
+  std::vector<std::string> args = auth.cfg;
+  args.push_back("clone");
   if (opts.depth && *opts.depth > 0) {
     args.push_back("--depth");
     args.push_back(std::to_string(*opts.depth));
@@ -64,9 +105,11 @@ void GitOps::clone(const std::string& url, const GitCloneOptions& opts) {
     args.push_back("--branch");
     args.push_back(*opts.branch);
   }
-  args.push_back(authUrl(url, opts.username.value_or(""), opts.password.value_or("")));
+  // `--` ends options: a url such as "--upload-pack=cmd" is then a (bad) repository, not an option.
+  args.push_back("--");
+  args.push_back(url);
   if (opts.path) args.push_back(*opts.path);
-  mustGit(args, opts.cwd);
+  mustGit(args, opts.cwd, auth.env, opts.password.value_or(""));
 }
 
 GitStatus GitOps::status(std::optional<std::string> cwd) {
@@ -157,32 +200,33 @@ GitCommitResult GitOps::commit(const std::string& message,
 void GitOps::pushPull(const std::string& op, const GitRemoteOptions& opts) {
   std::string remote = opts.remote.value_or("");
   if (remote.empty()) remote = "origin";
-  std::vector<std::string> cfg;
+  rejectOptionLike("remote", remote);
+  if (opts.branch) rejectOptionLike("branch", *opts.branch);
+  Auth auth;
   if (opts.username || opts.password) {
-    std::string plain = trim(runGit({"remote", "get-url", remote}, opts.cwd).stdout_);
-    if (!plain.empty()) {
-      std::string authed =
-          authUrl(plain, opts.username.value_or(""), opts.password.value_or(""));
-      if (authed != plain) {
-        cfg.push_back("-c");
-        cfg.push_back("url." + authed + ".insteadOf=" + plain);
-      }
-    }
+    // The helper is bound to the remote's origin, so resolve the remote's URL first.
+    std::string plain = trim(mustGit({"remote", "get-url", "--", remote}, opts.cwd));
+    auth = authFor(plain, opts.username.value_or(""), opts.password.value_or(""));
   }
-  std::vector<std::string> args = cfg;
+  std::vector<std::string> args = auth.cfg;
   args.push_back(op);
+  args.push_back("--");
   args.push_back(remote);
   if (opts.branch) args.push_back(*opts.branch);
-  mustGit(args, opts.cwd);
+  mustGit(args, opts.cwd, auth.env, opts.password.value_or(""));
 }
 
 void GitOps::push(const GitRemoteOptions& opts) { pushPull("push", opts); }
 void GitOps::pull(const GitRemoteOptions& opts) { pushPull("pull", opts); }
 
 void GitOps::checkout(const std::string& ref, const GitCheckoutOptions& opts) {
+  // A ref that starts with "-" would be read as an option ("--orphan=x" created a branch). Git never allows one as a
+  // branch name, so refuse it rather than guess.
+  rejectOptionLike("ref", ref);
   std::vector<std::string> args = {"checkout"};
   if (opts.create) args.push_back("-b");
   args.push_back(ref);
+  args.push_back("--");
   mustGit(args, opts.cwd);
 }
 

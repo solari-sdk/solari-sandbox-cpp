@@ -7,6 +7,7 @@
 // exactly how the reference git.test.mjs stubs `runCommand`.
 #pragma once
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -35,16 +36,31 @@ class GitOps {
   std::vector<GitBranch> branches(std::optional<std::string> cwd = std::nullopt);
   std::vector<GitCommit> log(const GitLogOptions& opts = {});
 
-  /** Splice basic-auth creds into an https remote URL (public for testing). */
-  static std::string authUrl(const std::string& url, const std::string& username,
-                             const std::string& password);
+  /**
+   * Credentials for ONE git command against `remoteUrl`: `-c` options and environment. The credentials travel as
+   * environment variables of that command and git reads them back through an inline credential helper, so they are
+   * never in the URL (and so not in .git/config, a snapshot or a template), never in argv (/proc/<pid>/cmdline) and
+   * never in a config file. The helper is bound to the remote's origin (`credential.<scheme>://<host>.helper`), so git
+   * never offers the password to another host. `ok` is false when there are no credentials or the remote is not
+   * http(s). Public for testing.
+   */
+  struct Auth {
+    bool ok = false;
+    std::vector<std::string> cfg;
+    std::map<std::string, std::string> env;
+  };
+  static Auth authFor(const std::string& remoteUrl, const std::string& username,
+                      const std::string& password);
 
  private:
   CommandRunner run_;
   CommandResult runGit(const std::vector<std::string>& args,
-                       std::optional<std::string> cwd);
+                       std::optional<std::string> cwd,
+                       const std::map<std::string, std::string>& env = {});
   std::string mustGit(const std::vector<std::string>& args,
-                      std::optional<std::string> cwd);
+                      std::optional<std::string> cwd,
+                      const std::map<std::string, std::string>& env = {},
+                      const std::string& secret = "");
   void pushPull(const std::string& op, const GitRemoteOptions& opts);
 };
 
