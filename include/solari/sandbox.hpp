@@ -4,6 +4,8 @@
 // `.git`. Blocking synchronous API; async output arrives on the channel's rx
 // thread as v2 cmd.data/cmd.exit frames. Ported from `@solarisdk/core` handle.ts.
 #pragma once
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -37,15 +39,41 @@ struct SandboxConfig {
   SessionHooks hooks;
 };
 
-/** Shared state of a started command; mutated by the rx thread + the caller. */
+/**
+ * Shared state of a started command; mutated by the rx thread + the caller.
+ *
+ * The rx thread only queues events (`push`); a delivery thread of the command's own runs the callbacks and settles the
+ * exit, in order, with no lock held. A callback may therefore call back into the SDK (onData, stdin_write, a file read)
+ * without deadlocking or stalling the rx thread that has to deliver the reply.
+ */
 struct CmdState {
-  std::mutex m;
+  std::mutex m;  // guards cbs, buffered, settled
   std::vector<std::function<void(const std::string& stream, const std::string& data)>>
       cbs;
   std::vector<std::pair<std::string, std::string>> buffered;  // stream,data
   std::promise<int> exitProm;
   std::shared_future<int> exitFut;
   bool settled = false;
+
+  struct Event {
+    bool isExit = false;
+    std::string stream, data;
+    int code = 0;
+    std::exception_ptr err;
+  };
+  std::mutex qm;
+  std::condition_variable qcv;
+  std::deque<Event> q;
+  bool exitQueued = false;
+
+  /** Queue an event for the delivery thread; events after the exit are dropped. */
+  void push(Event ev) {
+    std::lock_guard<std::mutex> lk(qm);
+    if (exitQueued) return;
+    if (ev.isExit) exitQueued = true;
+    q.push_back(std::move(ev));
+    qcv.notify_one();
+  }
 };
 
 /** A started command (`commands.start`). */
@@ -68,6 +96,8 @@ class CommandHandle {
   void stdin_write(const std::string& data);
   /** Send a signal (0 => server default). */
   void kill(int signal = 0);
+  /** Close the command's stdin (the guest writes nothing, then closes it). */
+  void closeStdin();
 
  private:
   ControlChannel* ch_;
@@ -140,6 +170,9 @@ class Sandbox {
  private:
   // Internal: `tap` is subscribed before any frame handler is registered, so output that beat
   // the cmd.start reply reaches it as well as the caller's callbacks (see runCommand).
+  CommandResult waitCancellable(CommandHandle& h, const CommandOptions& opts,
+                                const std::shared_ptr<std::string>& out,
+                                const std::shared_ptr<std::string>& err);
   CommandHandle startCommandTapped(
       const std::string& cmd, const CommandOptions& opts,
       std::function<void(const std::string&, const std::string&)> tap);
@@ -166,8 +199,13 @@ class Sandbox {
     explicit Files(Sandbox& s) : s_(s) {}
     std::string read(const std::string& path);      // raw bytes
     std::string readText(const std::string& path);  // == read (UTF-8)
+    /** Write in one frame. More than 32 MiB is refused before anything is sent: use upload(). */
     void write(const std::string& path, const std::string& data,
                std::optional<int> mode = std::nullopt);
+    /** Write in 4 MiB chunks (fs.upload); any size. An empty file is one zero-length call. */
+    void upload(const std::string& path, const std::string& data);
+    /** Read a whole file in 4 MiB chunks (fs.download) until the guest reports the end. */
+    std::string download(const std::string& path);
     std::vector<FsEntry> list(const std::string& path);
     FsStat stat(const std::string& path);
     void mkdir(const std::string& path);
@@ -205,6 +243,7 @@ class Sandbox {
   long callTimeoutMs_;
   SessionHooks hooks_;
   std::shared_ptr<ControlChannel> channel_;
+  std::mutex connectMu_;      // serialises connect(): concurrent callers each opened a socket and leaked the others
   std::shared_ptr<void> ws_;  // WsControlTransport when SOLARI_WITH_WS
 };
 

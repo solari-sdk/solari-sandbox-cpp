@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2
+
+### Added
+- **`files.upload` and `files.download`** move a file in 4 MiB chunks (`fs.upload` / `fs.download`), so a large file never travels as one frame. A 48 MiB file used to be a 64 MiB frame that closed the control channel and failed every call in flight on it. `files.read` now reads through the same chunked loop (a guest image that predates `fs.download` is read with `fs.read`).
+- **`CancelToken`** (`CommandOptions::cancel`, `RunCodeOptions::cancel`): call `cancel()` from another thread and the run stops the guest process (SIGTERM and a closed stdin at once, SIGKILL 2 s later; `code.interrupt` for code, ignored by a guest that does not know it) and throws `CancelledError`. A cancellable `commands.run` always uses the control channel. `CommandHandle::closeStdin()` closes a command's stdin.
+
+### Changed
+- `files.write` refuses more than 32 MiB before sending anything (`file too large for a single call (N bytes, max 33554432): use files.upload()/files.download() or uploadUrl()`), so one big call fails alone and the channel stays up. Use `upload` for larger files.
+
+### Fixed
+- **A callback may call back into the SDK.** Output callbacks ran on the rx thread with the command's mutex held, so a callback that called `onData` deadlocked, and one that called `stdin_write` or read a file stalled the thread that had to deliver the reply. Each command now has a delivery thread of its own that runs the callbacks and settles the exit in order, with no lock held; `wait()` returns after the last callback.
+- **Concurrent `Sandbox::connect()` calls open one socket,** not one each (the extras leaked with their reader threads).
+
 ## 0.3.1
 
 ### Fixed

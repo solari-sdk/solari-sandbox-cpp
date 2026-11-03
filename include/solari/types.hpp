@@ -2,7 +2,9 @@
 // reference `@solarisdk/core` types.ts. `Chart.elements` is kept as raw
 // nlohmann::json so new chart types never force an SDK bump.
 #pragma once
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <functional>
 #include <map>
 #include <optional>
@@ -15,6 +17,21 @@ namespace solari {
 using Json = nlohmann::json;
 
 // --- commands ---------------------------------------------------------------
+
+/**
+ * Cancels a running `commands.run` / `code.run` from another thread: share one with the call (`CommandOptions::cancel`,
+ * `RunCodeOptions::cancel`) and call `cancel()`. The call then stops the guest process (SIGTERM and a closed stdin at once,
+ * SIGKILL 2 s later; `code.interrupt` for code) and throws `CancelledError`. A cancellable `commands.run` always uses the
+ * control channel, which must be open.
+ */
+class CancelToken {
+ public:
+  void cancel() { cancelled_.store(true); }
+  bool isCancelled() const { return cancelled_.load(); }
+
+ private:
+  std::atomic<bool> cancelled_{false};
+};
 
 /** Terminal result of a command run. */
 struct CommandResult {
@@ -35,6 +52,8 @@ struct CommandOptions {
   bool background = false;
   std::function<void(const std::string&)> onStdout;
   std::function<void(const std::string&)> onStderr;
+  /** Cancel the run from another thread; see CancelToken. */
+  std::shared_ptr<CancelToken> cancel;
 };
 
 /** Body for the one-shot `POST /sandboxes/:id/exec` fast path. */
@@ -111,6 +130,8 @@ struct RunCodeOptions {
   std::optional<std::string> contextId;
   std::function<void(const std::string&)> onStdout;
   std::function<void(const std::string&)> onStderr;
+  /** Cancel the run from another thread; see CancelToken. */
+  std::shared_ptr<CancelToken> cancel;
 };
 
 // --- git --------------------------------------------------------------------
