@@ -1,6 +1,9 @@
 #include "solari/sandbox.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <thread>
 
 #include "solari/errors.hpp"
 #include "solari/util.hpp"
@@ -15,12 +18,21 @@ namespace solari {
 
 void CommandHandle::onData(
     std::function<void(const std::string&, const std::string&)> cb) {
-  std::lock_guard<std::mutex> lk(st_->m);
-  if (!st_->buffered.empty()) {
-    for (auto& c : st_->buffered) cb(c.first, c.second);
-    st_->buffered.clear();
+  // Replay buffered output in order and register cb only once nothing is left to replay; the replay runs with no lock
+  // held, so a callback may itself call onData (it used to deadlock on the state's mutex). Chunks that arrive meanwhile
+  // are buffered again and drained by the next pass.
+  for (;;) {
+    std::vector<std::pair<std::string, std::string>> replay;
+    {
+      std::lock_guard<std::mutex> lk(st_->m);
+      if (st_->buffered.empty()) {
+        st_->cbs.push_back(std::move(cb));
+        return;
+      }
+      replay.swap(st_->buffered);
+    }
+    for (auto& c : replay) cb(c.first, c.second);
   }
-  st_->cbs.push_back(std::move(cb));
 }
 
 int CommandHandle::wait() { return st_->exitFut.get(); }
@@ -35,6 +47,10 @@ std::optional<int> CommandHandle::waitFor(long timeoutMs) {
 void CommandHandle::stdin_write(const std::string& data) {
   ch_->call("cmd.stdin", {{"cmdId", cmdId_}, {"base64", base64Encode(data)}},
             callTimeoutMs_);
+}
+
+void CommandHandle::closeStdin() {
+  ch_->call("cmd.stdin", {{"cmdId", cmdId_}, {"base64", ""}, {"eof", true}}, callTimeoutMs_);
 }
 
 void CommandHandle::kill(int signal) {
@@ -74,6 +90,7 @@ Sandbox::~Sandbox() { channel_->close(); }
 
 void Sandbox::connect() {
 #ifdef SOLARI_WITH_WS
+  std::lock_guard<std::mutex> connectLock(connectMu_);
   if (channel_->connected()) return;
   auto ws = std::make_shared<WsControlTransport>(controlUrl_, apiKey_, channel_);
   ws->connect();  // blocks with retry; throws on failure
@@ -138,12 +155,44 @@ CommandHandle Sandbox::startCommandTapped(
   auto st = std::make_shared<CmdState>();
   st->exitFut = st->exitProm.get_future().share();
 
-  channel_->onStreamClose(cmdId, [st](const std::exception_ptr& e) {
-    std::lock_guard<std::mutex> lk(st->m);
-    if (!st->settled) {
-      st->settled = true;
-      st->exitProm.set_exception(e);
+  // Delivery thread: runs the callbacks and settles the exit in arrival order, never on the rx thread.
+  std::thread([st] {
+    for (;;) {
+      CmdState::Event ev;
+      {
+        std::unique_lock<std::mutex> lk(st->qm);
+        st->qcv.wait(lk, [&] { return !st->q.empty(); });
+        ev = std::move(st->q.front());
+        st->q.pop_front();
+      }
+      if (!ev.isExit) {
+        std::vector<std::function<void(const std::string&, const std::string&)>> cbs;
+        {
+          std::lock_guard<std::mutex> lk(st->m);
+          if (st->cbs.empty()) {
+            st->buffered.emplace_back(ev.stream, ev.data);
+            continue;
+          }
+          cbs = st->cbs;
+        }
+        for (auto& cb : cbs) cb(ev.stream, ev.data);
+        continue;
+      }
+      std::lock_guard<std::mutex> lk(st->m);
+      if (!st->settled) {
+        st->settled = true;
+        if (ev.err) st->exitProm.set_exception(ev.err);
+        else st->exitProm.set_value(ev.code);
+      }
+      return;
     }
+  }).detach();
+
+  channel_->onStreamClose(cmdId, [st](const std::exception_ptr& e) {
+    CmdState::Event ev;
+    ev.isExit = true;
+    ev.err = e;
+    st->push(std::move(ev));
   });
 
   // Subscribed before the frame handlers below: registering them flushes frames that beat the
@@ -169,34 +218,21 @@ CommandHandle Sandbox::startCommandTapped(
 
   ControlChannel* ch = channel_.get();
   channel_->onFrame("cmd.data", cmdId, [st](const nlohmann::json& f) {
-    std::string stream =
-        (f.contains("stream") && f["stream"].is_string())
-            ? f["stream"].get<std::string>()
-            : "stdout";
-    std::string data =
-        (f.contains("base64") && f["base64"].is_string())
-            ? base64Decode(f["base64"].get<std::string>())
-            : "";
-    std::lock_guard<std::mutex> lk(st->m);
-    if (st->cbs.empty()) {
-      st->buffered.emplace_back(stream, data);
-    } else {
-      for (auto& cb : st->cbs) cb(stream, data);
-    }
+    CmdState::Event ev;
+    ev.stream = (f.contains("stream") && f["stream"].is_string()) ? f["stream"].get<std::string>() : "stdout";
+    ev.data = (f.contains("base64") && f["base64"].is_string()) ? base64Decode(f["base64"].get<std::string>()) : "";
+    st->push(std::move(ev));
   });
   channel_->onFrame("cmd.exit", cmdId, [ch, cmdId, st](const nlohmann::json& f) {
     ch->offFrame("cmd.data", cmdId);
     ch->offFrame("cmd.exit", cmdId);
     ch->offStreamClose(cmdId);
-    int code = 0;
+    CmdState::Event ev;
+    ev.isExit = true;
     if (f.contains("exitCode") && f["exitCode"].is_number()) {
-      code = static_cast<int>(f["exitCode"].get<double>());
+      ev.code = static_cast<int>(f["exitCode"].get<double>());
     }
-    std::lock_guard<std::mutex> lk(st->m);
-    if (!st->settled) {
-      st->settled = true;
-      st->exitProm.set_value(code);
-    }
+    st->push(std::move(ev));
   });
 
   return CommandHandle(ch, cmdId, st, callTimeoutMs_);
@@ -219,8 +255,9 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
                                   const CommandOptions& opts) {
   // One-shot HTTP fast path: plain run-to-completion, no streaming/env/user,
   // channel not already open. Falls back to WS only when /exec is unavailable.
+  // (A cancellable run always takes the control-channel path: the one-shot route has no command id to signal.)
   if (hooks_.exec && !opts.background && !opts.onStdout && !opts.onStderr &&
-      opts.env.empty() && !opts.user && !channel_->connected()) {
+      opts.env.empty() && !opts.user && !opts.cancel && !channel_->connected()) {
     try {
       ExecOneShotRequest req;
       req.cmd = cmd;
@@ -242,6 +279,7 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
         else *err += data;
       });
   if (opts.background) return CommandResult{0, "", ""};
+  if (opts.cancel) return waitCancellable(h, opts, out, err);
   // timeoutMs is a deadline for the command, as on the REST /exec path: when it elapses the command
   // is killed and the result is exit -1 with the output so far (the guest's own timeout result).
   // Without this a hung command waited here forever.
@@ -260,13 +298,109 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
   return CommandResult{code, *out, *err};
 }
 
+// What a cancelled run does to the guest process: SIGTERM and a closed stdin now, SIGKILL after kCancelKillGraceMs if it has
+// not exited. Every call is best effort (a command that already finished answers with an error); the escalation runs on its
+// own thread so the cancelled caller returns at once.
+static constexpr long kCancelKillGraceMs = 2000;
+
+static void stopAfterCancel(CommandHandle h, std::shared_ptr<ControlChannel> keepAlive) {
+  try {
+    h.kill(15);
+  } catch (const Error&) {
+  }
+  try {
+    h.closeStdin();
+  } catch (const Error&) {
+  }
+  std::thread([h, keepAlive]() mutable {
+    if (h.waitFor(kCancelKillGraceMs)) return;
+    try {
+      h.kill(9);
+    } catch (const Error&) {
+    }
+  }).detach();
+}
+
+CommandResult Sandbox::waitCancellable(CommandHandle& h, const CommandOptions& opts,
+                                       const std::shared_ptr<std::string>& out,
+                                       const std::shared_ptr<std::string>& err) {
+  using clock = std::chrono::steady_clock;
+  const bool hasDeadline = opts.timeoutMs && *opts.timeoutMs > 0;
+  const auto deadline = clock::now() + std::chrono::milliseconds(hasDeadline ? *opts.timeoutMs : 0);
+  for (;;) {
+    if (opts.cancel->isCancelled()) {
+      stopAfterCancel(h, channel_);
+      throw CancelledError();
+    }
+    long slice = 50;
+    if (hasDeadline) {
+      const long left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - clock::now()).count();
+      if (left <= 0) {
+        try {
+          h.kill(9);
+        } catch (const Error&) {
+        }
+        return CommandResult{-1, *out, *err, true};
+      }
+      slice = std::min(slice, left);
+    }
+    if (std::optional<int> code = h.waitFor(slice)) return CommandResult{*code, *out, *err};
+  }
+}
+
 RunCodeResult Sandbox::runCode(const std::string& code,
                                const RunCodeOptions& opts) {
   nlohmann::json params = {{"code", code}};
   if (opts.language) params["language"] = *opts.language;
   if (opts.contextId) params["contextId"] = *opts.contextId;
-  nlohmann::json r = channel_->call("code.run", params, timeout());
-  return flattenCodeResult(r, opts.onStdout, opts.onStderr);
+  if (!opts.cancel) {
+    nlohmann::json r = channel_->call("code.run", params, timeout());
+    return flattenCodeResult(r, opts.onStdout, opts.onStderr);
+  }
+  // Cancellable: the call blocks, so it runs on its own thread while this one watches the token.
+  struct Outcome {
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    nlohmann::json result;
+    std::exception_ptr error;
+  };
+  auto outcome = std::make_shared<Outcome>();
+  auto channel = channel_;
+  const long callTimeout = timeout();
+  std::thread([outcome, channel, params, callTimeout] {
+    nlohmann::json r;
+    std::exception_ptr e;
+    try {
+      r = channel->call("code.run", params, callTimeout);
+    } catch (...) {
+      e = std::current_exception();
+    }
+    std::lock_guard<std::mutex> lk(outcome->m);
+    outcome->result = std::move(r);
+    outcome->error = e;
+    outcome->done = true;
+    outcome->cv.notify_all();
+  }).detach();
+  std::unique_lock<std::mutex> lk(outcome->m);
+  while (!outcome->done) {
+    if (opts.cancel->isCancelled()) {
+      lk.unlock();
+      // Ask the guest to stop the code (best effort: a guest that predates code.interrupt answers "unknown method").
+      std::thread([channel, ctx = opts.contextId, callTimeout] {
+        nlohmann::json p = nlohmann::json::object();
+        if (ctx) p["contextId"] = *ctx;
+        try {
+          channel->call("code.interrupt", p, callTimeout);
+        } catch (...) {
+        }
+      }).detach();
+      throw CancelledError();
+    }
+    outcome->cv.wait_for(lk, std::chrono::milliseconds(50));
+  }
+  if (outcome->error) std::rethrow_exception(outcome->error);
+  return flattenCodeResult(outcome->result, opts.onStdout, opts.onStderr);
 }
 
 // --- Files ------------------------------------------------------------------
@@ -282,15 +416,72 @@ static FsStat parseStat(const nlohmann::json& j) {
   return s;
 }
 
+namespace {
+// How much one fs.upload / fs.download call moves. A bigger frame (a 48 MiB file is a 64 MiB frame once base64'd) closes the
+// control channel and fails every call in flight on it.
+constexpr std::size_t kFileChunkSize = 4u << 20;
+// The most write() sends in one frame; upload() has no such limit.
+constexpr std::size_t kMaxSingleFrameBytes = 32u << 20;
+
+bool isUnknownMethod(const ActionError& e) {
+  std::string m = std::string(e.what()) + " " + e.code.value_or("");
+  for (auto& c : m) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return m.find("unknown method") != std::string::npos || m.find("method not found") != std::string::npos ||
+         m.find("unknown_method") != std::string::npos;
+}
+}  // namespace
+
 std::string Sandbox::Files::read(const std::string& path) {
+  // Chunked, so a large file never travels as one frame; a guest image that predates fs.download is read in one frame.
+  try {
+    return download(path);
+  } catch (const ActionError& e) {
+    if (!isUnknownMethod(e)) throw;
+  }
   nlohmann::json r = s_.channel_->call("fs.read", {{"path", path}}, s_.timeout());
   return base64Decode(r.at("base64").get<std::string>());
+}
+
+std::string Sandbox::Files::download(const std::string& path) {
+  std::string out;
+  std::int64_t offset = 0;
+  for (;;) {
+    nlohmann::json r = s_.channel_->call(
+        "fs.download", {{"path", path}, {"offset", offset}, {"length", kFileChunkSize}}, s_.timeout());
+    std::string chunk = base64Decode(r.value("base64", std::string()));
+    out += chunk;
+    if (r.value("eof", false)) return out;
+    std::int64_t next = offset + static_cast<std::int64_t>(chunk.size());
+    if (r.contains("nextOffset") && r["nextOffset"].is_number()) next = r["nextOffset"].get<std::int64_t>();
+    if (next <= offset) throw Error("Solari: fs.download made no progress at offset " + std::to_string(offset));
+    offset = next;
+  }
+}
+
+void Sandbox::Files::upload(const std::string& path, const std::string& data) {
+  std::size_t offset = 0;
+  for (;;) {
+    const std::size_t end = std::min(offset + kFileChunkSize, data.size());
+    s_.channel_->call("fs.upload",
+                      {{"path", path},
+                       {"base64", base64Encode(data.substr(offset, end - offset))},
+                       {"offset", offset},
+                       {"truncate", offset == 0}},
+                      s_.timeout());
+    if (end >= data.size()) return;
+    offset = end;
+  }
 }
 
 std::string Sandbox::Files::readText(const std::string& path) { return read(path); }
 
 void Sandbox::Files::write(const std::string& path, const std::string& data,
                            std::optional<int> mode) {
+  if (data.size() > kMaxSingleFrameBytes) {
+    throw Error("file too large for a single call (" + std::to_string(data.size()) + " bytes, max " +
+                std::to_string(kMaxSingleFrameBytes) +
+                "): use files.upload()/files.download() or uploadUrl()");
+  }
   nlohmann::json p = {{"path", path}, {"base64", base64Encode(data)}};
   if (mode) p["mode"] = *mode;
   s_.channel_->call("fs.write", p, s_.timeout());

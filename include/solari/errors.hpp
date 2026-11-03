@@ -86,6 +86,12 @@ class ActionError : public Error {
       : Error(message), method(std::move(m)), code(std::move(c)) {}
 };
 
+/** A `commands.run` / `code.run` stopped because its `CancelToken` was cancelled. */
+class CancelledError : public Error {
+ public:
+  CancelledError() : Error("The call was cancelled") {}
+};
+
 /** An RPC / connect did not complete within its timeout. */
 class TimeoutError : public Error {
  public:

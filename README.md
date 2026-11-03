@@ -98,6 +98,7 @@ int main() {
   // Files.
   sbx->files.write("/tmp/hello.txt", "hi\n");
   std::string body = sbx->files.read("/tmp/hello.txt");
+  // Files over 32 MiB: sbx->files.upload(path, data) / download(path) move them in 4 MiB chunks.
   for (const auto& e : sbx->files.list("/tmp"))
     std::cout << (e.dir ? "d " : "- ") << e.name << " (" << e.size << ")\n";
 
