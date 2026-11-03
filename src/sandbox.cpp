@@ -54,6 +54,7 @@ Sandbox::Sandbox(const CreateSandboxResponse& resp, SandboxConfig config)
       expiresAt_(resp.expiresAt),
       kind_(resp.kind),
       streamUrl_(resp.streamUrl),
+      recordingUrl_(resp.recordingUrl),
       apiKey_(config.apiKey),
       callTimeoutMs_(config.callTimeoutMs),
       hooks_(std::move(config.hooks)),
@@ -201,6 +202,19 @@ CommandHandle Sandbox::startCommandTapped(
   return CommandHandle(ch, cmdId, st, callTimeoutMs_);
 }
 
+// A 404 on /exec means "route not served" (an older gateway) only when it is not a gateway answer: a missing route comes
+// back as a plain-text "404 Not Found", a deleted or unknown sandbox as JSON ({"error":"Not found"}). The latter must reach
+// the caller, or the control-channel fallback hides it behind "not connected".
+static bool isRouteUnavailable(const GatewayError& e) {
+  if (e.status == 405 || e.status == 501) return true;
+  if (e.status != 404) return false;
+  const nlohmann::json& b = e.body;
+  const bool gatewayAnswer = b.is_object() && ((b.contains("error") && b["error"].is_string()) ||
+                                               (b.contains("code") && b["code"].is_string()) ||
+                                               (b.contains("message") && b["message"].is_string()));
+  return !gatewayAnswer;
+}
+
 CommandResult Sandbox::runCommand(const std::string& cmd,
                                   const CommandOptions& opts) {
   // One-shot HTTP fast path: plain run-to-completion, no streaming/env/user,
@@ -215,7 +229,7 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
       if (opts.timeoutMs) req.timeoutMs = opts.timeoutMs;
       return hooks_.exec(id_, req);
     } catch (const GatewayError& e) {
-      if (!(e.status == 404 || e.status == 405 || e.status == 501)) throw;
+      if (!isRouteUnavailable(e)) throw;
       // else fall through to the WS path
     }
   }
@@ -238,7 +252,7 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
         h.kill(9);
       } catch (const Error&) {
       }
-      return CommandResult{-1, *out, *err};
+      return CommandResult{-1, *out, *err, true};
     }
     return CommandResult{*code, *out, *err};
   }

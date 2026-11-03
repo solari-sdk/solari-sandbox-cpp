@@ -91,6 +91,8 @@ class Sandbox {
   /** The live-view stream URL. Set for desktops only — a headless sandbox has
    *  no display, so the gateway omits it. */
   const std::optional<std::string>& streamUrl() const { return streamUrl_; }
+  /** The session recording link, when the create asked for a recording. */
+  const std::optional<std::string>& recordingUrl() const { return recordingUrl_; }
 
   /** Open the control WebSocket (IXWebSocket). No-op / throws when built
    *  without SOLARI_WITH_WS. Idempotent. */
@@ -198,6 +200,7 @@ class Sandbox {
   std::string expiresAt_;
   std::string kind_;
   std::optional<std::string> streamUrl_;
+  std::optional<std::string> recordingUrl_;
   std::string apiKey_;
   long callTimeoutMs_;
   SessionHooks hooks_;

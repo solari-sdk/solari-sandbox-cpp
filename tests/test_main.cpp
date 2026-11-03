@@ -171,6 +171,56 @@ TEST_CASE("non-JSON lines are ignored, not fatal") {
 }
 
 // ---------------------------------------------------------------------------
+// commands.run one-shot: a JSON 404 is a gateway answer, not "route unavailable"; timedOut and recordingUrl are kept
+// ---------------------------------------------------------------------------
+static Sandbox sandboxWithExec(std::function<CommandResult(const std::string&, const ExecOneShotRequest&)> exec) {
+  CreateSandboxResponse resp;
+  resp.sandboxId = "sb";
+  resp.controlUrl = "ws://127.0.0.1:1/control/sb";
+  resp.recordingUrl = "https://rec.example/r/1";
+  SandboxConfig cfg;
+  cfg.callTimeoutMs = 200;
+  cfg.hooks.exec = std::move(exec);
+  return Sandbox(resp, cfg);
+}
+
+TEST_CASE("a JSON 404 from /exec reaches the caller instead of falling back to the control channel") {
+  Sandbox sbx = sandboxWithExec([](const std::string&, const ExecOneShotRequest&) -> CommandResult {
+    throw GatewayError(404, "Not found", json{{"error", "Not found"}});
+  });
+  CHECK_THROWS_AS(sbx.commands.run("true"), GatewayError);
+}
+
+TEST_CASE("a plain-text 404 (route not served) still falls back to the control channel") {
+  Sandbox sbx = sandboxWithExec([](const std::string&, const ExecOneShotRequest&) -> CommandResult {
+    throw GatewayError(404, "Gateway request failed with status 404", json());
+  });
+  // The fallback needs a control channel, which this handle does not have: whatever it throws, it is not the 404.
+  bool gateway404 = false;
+  try {
+    sbx.commands.run("true");
+  } catch (const GatewayError&) {
+    gateway404 = true;
+  } catch (...) {
+  }
+  CHECK_FALSE(gateway404);
+}
+
+TEST_CASE("timedOut survives the one-shot result; recordingUrl reaches the handle") {
+  Sandbox sbx = sandboxWithExec([](const std::string&, const ExecOneShotRequest&) {
+    CommandResult r;
+    r.exitCode = -1;
+    r.timedOut = true;
+    return r;
+  });
+  CommandResult r = sbx.commands.run("sleep", {});
+  CHECK(r.timedOut);
+  CHECK(r.exitCode == -1);
+  REQUIRE(sbx.recordingUrl().has_value());
+  CHECK(*sbx.recordingUrl() == "https://rec.example/r/1");
+}
+
+// ---------------------------------------------------------------------------
 // commands.run: full result assembly from a scripted frame sequence
 // ---------------------------------------------------------------------------
 TEST_CASE("commands.run assembles {exitCode,stdout,stderr} from frames") {

@@ -21,6 +21,8 @@ struct CommandResult {
   int exitCode = 0;
   std::string stdout_;
   std::string stderr_;
+  /** True when the command hit its `timeoutMs` and was killed (`exitCode` is -1 then). */
+  bool timedOut = false;
 };
 
 /** Options for `commands.run` / `commands.start`. */
@@ -258,6 +260,8 @@ struct CreateSandboxResponse {
   std::string controlUrl;
   std::string expiresAt;
   std::optional<std::string> streamUrl;
+  /** The session recording link, when the create asked for a recording. */
+  std::optional<std::string> recordingUrl;
 };
 
 /** `GET /sandboxes/:id` response. */
