@@ -251,20 +251,33 @@ static bool isRouteUnavailable(const GatewayError& e) {
   return !gatewayAnswer;
 }
 
+// The gateway refusing a command stream because the sandbox is on the shared isolation tier.
+static bool isSharedRefusal(const ActionError& e) {
+  if (e.code && *e.code == "NotAvailableOnSharedIsolation") return true;
+  const std::string m = e.what();
+  return m.find("NotAvailableOnSharedIsolation") != std::string::npos ||
+         m.find("not available on a shared") != std::string::npos;
+}
+
 CommandResult Sandbox::runCommand(const std::string& cmd,
                                   const CommandOptions& opts) {
-  // One-shot HTTP fast path: plain run-to-completion, no streaming/env/user,
-  // channel not already open. Falls back to WS only when /exec is unavailable.
+  // One-shot HTTP fast path: plain run-to-completion, no streaming/env/user. Falls back to WS only when /exec is unavailable.
   // (A cancellable run always takes the control-channel path: the one-shot route has no command id to signal.)
-  if (hooks_.exec && !opts.background && !opts.onStdout && !opts.onStderr &&
-      opts.env.empty() && !opts.user && !opts.cancel && !channel_->connected()) {
+  const bool restEligible = hooks_.exec && !opts.background && !opts.onStdout && !opts.onStderr && opts.env.empty() &&
+                            !opts.user && !opts.cancel;
+  auto viaRest = [&]() {
+    ExecOneShotRequest req;
+    req.cmd = cmd;
+    req.args = opts.args;
+    if (opts.cwd) req.cwd = opts.cwd;
+    if (opts.timeoutMs) req.timeoutMs = opts.timeoutMs;
+    return hooks_.exec(id_, req);
+  };
+  // A shared sandbox refuses command streams (cmd.start) but runs commands over REST, so once we know the sandbox is shared
+  // the REST route is the only one that works, whether or not the control channel is open.
+  if (restEligible && (!channel_->connected() || shared_.load())) {
     try {
-      ExecOneShotRequest req;
-      req.cmd = cmd;
-      req.args = opts.args;
-      if (opts.cwd) req.cwd = opts.cwd;
-      if (opts.timeoutMs) req.timeoutMs = opts.timeoutMs;
-      return hooks_.exec(id_, req);
+      return viaRest();
     } catch (const GatewayError& e) {
       if (!isRouteUnavailable(e)) throw;
       // else fall through to the WS path
@@ -273,11 +286,22 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
 
   auto out = std::make_shared<std::string>();
   auto err = std::make_shared<std::string>();
-  CommandHandle h = startCommandTapped(
-      cmd, opts, [out, err](const std::string& stream, const std::string& data) {
-        if (stream == "stdout") *out += data;
-        else *err += data;
-      });
+  auto tap = [out, err](const std::string& stream, const std::string& data) {
+    if (stream == "stdout") *out += data;
+    else *err += data;
+  };
+  std::optional<CommandHandle> started;
+  try {
+    started.emplace(startCommandTapped(cmd, opts, tap));
+  } catch (const ActionError& e) {
+    if (!isSharedRefusal(e)) throw;
+    // The sandbox is shared: remember it, and run this command over REST if it can be (the refusal means nothing started, so
+    // nothing can run twice).
+    shared_ = true;
+    if (restEligible) return viaRest();
+    throw;
+  }
+  CommandHandle& h = *started;
   if (opts.background) return CommandResult{0, "", ""};
   if (opts.cancel) return waitCancellable(h, opts, out, err);
   // timeoutMs is a deadline for the command, as on the REST /exec path: when it elapses the command

@@ -4,6 +4,7 @@
 // `.git`. Blocking synchronous API; async output arrives on the channel's rx
 // thread as v2 cmd.data/cmd.exit frames. Ported from `@solarisdk/core` handle.ts.
 #pragma once
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <future>
@@ -168,6 +169,8 @@ class Sandbox {
   CommandHandle startCommand(const std::string& cmd, const CommandOptions& opts = {});
 
  private:
+  /** The gateway refused a command stream: this sandbox is on the shared tier (commands then run over REST). */
+  std::atomic<bool> shared_{false};
   // Internal: `tap` is subscribed before any frame handler is registered, so output that beat
   // the cmd.start reply reaches it as well as the caller's callbacks (see runCommand).
   CommandResult waitCancellable(CommandHandle& h, const CommandOptions& opts,

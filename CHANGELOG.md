@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3
+
+### Fixed
+- **`commands.run` on a shared-isolation sandbox works when the control channel is connected.** A shared sandbox refuses command streams (`cmd.start`, error `NotAvailableOnSharedIsolation`) but runs commands over REST; `run` on a connected channel sent `cmd.start` and threw the refusal. It now runs that command over REST `/exec` and remembers that the sandbox is shared, so later runs go straight to REST (the same behaviour as the TypeScript and Python SDKs). A run that needs a stream (an output callback, `env`, `user`, `background`, a `cancel` token) still throws the refusal.
+
 ## 0.3.2
 
 ### Added

@@ -43,9 +43,10 @@ struct Rig {
     r.controlUrl = "ws://127.0.0.1:1/control/sb";
     return r;
   }
-  static SandboxConfig cfg() {
+  static SandboxConfig cfg(SessionHooks hooks = {}) {
     SandboxConfig c;
     c.callTimeoutMs = 800;
+    c.hooks = std::move(hooks);
     return c;
   }
 
@@ -59,7 +60,7 @@ struct Rig {
     sbx.channel().setSend(nullptr);
   }
 
-  explicit Rig(Script s) : sbx(resp(), cfg()), script(std::move(s)) {
+  explicit Rig(Script s, SessionHooks hooks = {}) : sbx(resp(), cfg(std::move(hooks))), script(std::move(s)) {
     sbx.channel().setSend([this](const std::string& line) {
       if (dead) throw ConnectionError("rig is gone");
       json req = json::parse(line);
@@ -365,3 +366,78 @@ TEST_CASE("concurrent connect() calls open one socket") {
   server.stop();
 }
 #endif
+
+
+// ---- commands.run on a connected shared sandbox ------------------------------------------------------------------------------
+
+namespace {
+std::string sharedRefusal(const std::string& id) {
+  return json{{"id", id},
+              {"ok", false},
+              {"error", {{"code", "NotAvailableOnSharedIsolation"},
+                         {"message", "cmd.start is not available on a shared context: it operates on the whole VM, not this context"}}}}
+             .dump() + "\n";
+}
+}  // namespace
+
+// A shared sandbox refuses cmd.start but runs commands over REST: run() on a CONNECTED shared sandbox used to return the refusal.
+// It falls back to REST, and remembers the sandbox is shared so later runs do not try the stream again.
+TEST_CASE("commands.run on a connected shared sandbox falls back to REST /exec") {
+  std::atomic<int> rest{0};
+  SessionHooks hooks;
+  hooks.exec = [&](const std::string&, const ExecOneShotRequest& req) {
+    rest++;
+    return CommandResult{0, "hi from " + req.cmd, ""};
+  };
+  Rig rig([](const json& req) {
+    if (req["method"] == "cmd.start") return std::vector<std::string>{sharedRefusal(idOf(req))};
+    return std::vector<std::string>{reply(idOf(req), json::object())};
+  }, hooks);
+  CommandOptions o;
+  o.args = {"-c", "echo hi"};
+  for (int i = 0; i < 3; i++) {
+    CommandResult r = rig.sbx.commands.run("sh", o);
+    CHECK(r.exitCode == 0);
+    CHECK(r.stdout_ == "hi from sh");
+  }
+  CHECK(rest.load() == 3);
+  int starts = 0;
+  for (const auto& m : rig.methods()) starts += m == "cmd.start";
+  CHECK_MESSAGE(starts == 1, "the refusal is remembered: cmd.start sent once");
+}
+
+TEST_CASE("a streaming run on a shared sandbox still reports the refusal") {
+  std::atomic<int> rest{0};
+  SessionHooks hooks;
+  hooks.exec = [&](const std::string&, const ExecOneShotRequest&) {
+    rest++;
+    return CommandResult{0, "", ""};
+  };
+  Rig rig([](const json& req) { return std::vector<std::string>{sharedRefusal(idOf(req))}; }, hooks);
+  CommandOptions o;
+  o.args = {"-c", "echo hi"};
+  o.onStdout = [](const std::string&) {};
+  CHECK_THROWS_AS(rig.sbx.commands.run("sh", o), ActionError);
+  CHECK(rest.load() == 0);
+}
+
+// A run with per-command env or user cannot be served by REST (the one-shot route runs under the session env only): on a shared
+// sandbox it reports the refusal rather than silently running without its env.
+TEST_CASE("a run with env or user on a shared sandbox reports the refusal, never goes over REST") {
+  std::atomic<int> rest{0};
+  SessionHooks hooks;
+  hooks.exec = [&](const std::string&, const ExecOneShotRequest&) {
+    rest++;
+    return CommandResult{0, "", ""};
+  };
+  Rig rig([](const json& req) { return std::vector<std::string>{sharedRefusal(idOf(req))}; }, hooks);
+  CommandOptions withEnv;
+  withEnv.args = {"-c", "echo $X"};
+  withEnv.env = {{"X", "1"}};
+  CHECK_THROWS_AS(rig.sbx.commands.run("sh", withEnv), ActionError);
+  CommandOptions withUser;
+  withUser.args = {"-c", "id"};
+  withUser.user = "nobody";
+  CHECK_THROWS_AS(rig.sbx.commands.run("sh", withUser), ActionError);
+  CHECK(rest.load() == 0);
+}
