@@ -21,6 +21,13 @@ std::string base64Decode(const std::string& b64);
  */
 std::string encodeURIComponent(const std::string& s);
 
+/**
+ * Make a byte string valid UTF-8: every invalid or truncated sequence becomes one U+FFFD (the maximal-subpart rule of the WHATWG
+ * decoder, as Rust's `String::from_utf8_lossy` and JavaScript's TextDecoder do), NUL and valid sequences are kept. Applied to a whole
+ * stream, so a character split across two output chunks survives.
+ */
+std::string utf8Lossy(const std::string& bytes);
+
 /** Trim leading/trailing ASCII whitespace (matches JS `String.prototype.trim`). */
 std::string trim(const std::string& s);
 

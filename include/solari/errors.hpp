@@ -96,6 +96,17 @@ class SandboxNotStoppedError : public GatewayError {
   }
 };
 
+/**
+ * An argument the SDK refuses before any request is made (a `user` that is not `root` or a unix user name, a negative `timeoutMs`).
+ * The same class the gateway's REST routes answer with: status 400, code "ValidationError". Raised by the SDK for a command on
+ * every route, so a bad value fails the same way whether the command would have gone over `/exec` or the live connection.
+ */
+class ValidationError : public GatewayError {
+ public:
+  explicit ValidationError(const std::string& msg)
+      : GatewayError(400, msg, nlohmann::json{{"code", "ValidationError"}, {"error", msg}}) {}
+};
+
 /** A control-WS RPC returned `{ok:false}`. */
 class ActionError : public Error {
  public:
