@@ -52,7 +52,7 @@ class Client {
    *  concurrency slot (429 at the cap) and opens a new billing segment. Idempotent:
    *  an already-running sandbox answers 200 and its current control URL.
    *
-   *  GatewayError 409 `code`: NotStopped (use resume() for a paused one),
+   *  GatewayError 409 `code`: NotStopped (use resume() for a paused one; thrown as SandboxNotStoppedError, as is StartInProgress),
    *  StartInProgress, StoppedDiskMissing, StoppedDiskUnsafe, GoldenMismatch,
    *  DiskPlatformMismatch, DiskShaMismatch, DiskExceedsSpec, DiskOwnerMismatch, or
    *  HostCapabilityMissing (host pool not armed; not retryable). 503 NoCapacity /

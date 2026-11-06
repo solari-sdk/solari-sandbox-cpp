@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0
+
+### Added
+- **`SandboxNotStoppedError`** (a `GatewayError`, status 409) is thrown for a 409 `NotStopped` or `StartInProgress` from `Client::start()` / `Sandbox::start()`. `code` is `"NotStopped"` (the sandbox is in another state; use `resume()` for a paused one) or `"StartInProgress"` (a start is already under way: poll until the sandbox is running), and `state` holds the sandbox's current state when the gateway sends it. Other 409s (`StoppedDiskMissing`, `GoldenMismatch`, `HostCapabilityMissing`, `SnapshotNotRestorable`, ...) stay a plain `GatewayError`. This is the same type the TypeScript and Python SDKs expose. Code that caught `GatewayError` keeps working; the new class is a subclass.
+
 ## 0.3.3
 
 ### Fixed

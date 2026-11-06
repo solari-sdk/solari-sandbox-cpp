@@ -31,6 +31,9 @@ void throwGatewayError(int status, const nlohmann::json& body) {
       // The gateway's only JSON 403 is NotEntitled (the plan does not include sandboxes/desktops).
       if (code == "NotEntitled") throw PlanError(msg, body, 403);
       throw GatewayError(403, msg, body);
+    case 409:
+      if (code == "NotStopped" || code == "StartInProgress") throw SandboxNotStoppedError(msg, body);
+      throw GatewayError(409, msg, body);
     case 429:
       if (code.empty() || code == "ConcurrencyLimitExceeded") throw ConcurrencyLimitError(msg, body);
       throw GatewayError(429, msg, body);
