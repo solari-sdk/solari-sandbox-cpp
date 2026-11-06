@@ -1103,3 +1103,22 @@ TEST_CASE("a blank session id is rejected at the boundary") {
   CHECK_THROWS_AS(client.connect(""), Error);
   CHECK_THROWS_AS(client.connect("   "), Error);
 }
+
+// ---------------------------------------------------------------------------
+// utf8Lossy: command output is text decoded as UTF-8 over the whole stream
+// ---------------------------------------------------------------------------
+TEST_CASE("utf8Lossy replaces invalid sequences with U+FFFD and keeps valid text and NUL") {
+  const std::string fffd = "\xEF\xBF\xBD";
+  CHECK(utf8Lossy("plain ascii") == "plain ascii");
+  CHECK(utf8Lossy(std::string("a\0b\n", 4)) == std::string("a\0b\n", 4));
+  CHECK(utf8Lossy("\xE6\xBC\xA2\xE5\xAD\x97") == "\xE6\xBC\xA2\xE5\xAD\x97");        // valid 3-byte characters
+  CHECK(utf8Lossy("a\xFF" "b") == "a" + fffd + "b");                                  // a stray byte
+  CHECK(utf8Lossy("ok\xE6") == "ok" + fffd);                                          // truncated at the end: one replacement
+  CHECK(utf8Lossy("\xE6\xBC") == fffd);                                               // a truncated 3-byte sequence is ONE replacement
+  CHECK(utf8Lossy("\xF0\x9F\x98") == fffd);                                           // and so is a truncated 4-byte one
+  CHECK(utf8Lossy("\xC0\x80") == fffd + fffd);                                        // overlong forms are invalid
+  CHECK(utf8Lossy("\xED\xA0\x80") == fffd + fffd + fffd);                             // a UTF-16 surrogate is invalid
+  // A character split across two output chunks survives because the whole stream is decoded, not each chunk.
+  std::string stream = std::string("\xE6\xBC") + std::string("\xA2");
+  CHECK(utf8Lossy(stream) == "\xE6\xBC\xA2");
+}

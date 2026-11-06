@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0
+
+`commands.run` now behaves the same over the one-shot `/exec` route and the live control connection (the shared conformance rows in `tests/conformance/spec/commands.json` pin it; before this release 13 of them failed for this SDK).
+
+### Changed
+- **A command that needs the live connection opens it by itself.** `env`, `user`, callbacks, a cancel token or `background` used to throw "Not connected — call connect() first" on a sandbox whose channel was not open yet, and so did the fall back to the control connection when the gateway does not serve `/exec`. They now connect on demand, as the REST route is chosen without the caller doing anything.
+- **A deadline that fires below the guest is a result, not an error.** `400 ExecTimeout` and the guest's hidden vsock read timeout (`502 ... i/o timeout`) on `/exec` now return `CommandResult{exitCode -1, timedOut true}`, the same result the live connection gives when `timeoutMs` elapses.
+- **A command that cannot start is one error on both routes:** `ActionError` with `method "cmd.start"` and `code "ExecFailed"`. `/exec` reports it as a `400 ExecFailed` gateway error, which used to come back as `GatewayError`; the live connection's refusal carries no code, and `fork/exec ...` / `chdir ...` now get `ExecFailed`.
+- **`stdout_` / `stderr_` are UTF-8 text** decoded over the whole stream (a character split across two chunks survives; invalid bytes become U+FFFD; NUL is kept). They used to be the raw bytes on the live connection, which is not valid JSON or text for a binary command. Read exact bytes from the new `stdoutBytes` / `stderrBytes`. Callbacks still receive the raw chunks.
+- `args` is always in the `/exec` body and in `cmd.start` (an empty list when there are none).
+
+### Added
+- **`CommandResult::oomKilled`**: true when the guest's memory watchdog killed the command (exit 137 alone is ambiguous). Always present.
+- **`CommandResult::stdoutBytes` / `stderrBytes`**: the exact output bytes. Exact on the live connection; on `/exec` the gateway has already turned the output into text, so they are that text's bytes.
+- `solari::utf8Lossy()` in `solari/util.hpp`.
+
 ## 0.4.0
 
 ### Added

@@ -40,6 +40,13 @@ struct CommandResult {
   std::string stderr_;
   /** True when the command hit its `timeoutMs` and was killed (`exitCode` is -1 then). */
   bool timedOut = false;
+  /** True when the guest's memory watchdog killed the command (exit 137 alone is ambiguous). Always present. */
+  bool oomKilled = false;
+  /** The exact output bytes. `stdout_` / `stderr_` are UTF-8 text (invalid bytes become U+FFFD, decoded over the whole stream); a
+   *  command that prints binary data is read from these. Exact on the control connection; on the one-shot `/exec` route the gateway
+   *  has already turned the output into text, so these are that text's bytes. */
+  std::string stdoutBytes;
+  std::string stderrBytes;
 };
 
 /** Options for `commands.run` / `commands.start`. */

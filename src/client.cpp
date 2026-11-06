@@ -52,6 +52,9 @@ static CommandResult parseCommandResult(const nlohmann::json& j) {
   if (j.contains("stderr") && j["stderr"].is_string())
     r.stderr_ = j["stderr"].get<std::string>();
   if (j.contains("timedOut") && j["timedOut"].is_boolean()) r.timedOut = j["timedOut"].get<bool>();
+  if (j.contains("oomKilled") && j["oomKilled"].is_boolean()) r.oomKilled = j["oomKilled"].get<bool>();
+  r.stdoutBytes = r.stdout_;
+  r.stderrBytes = r.stderr_;
   return r;
 }
 
@@ -69,7 +72,7 @@ SessionHooks Client::makeHooks() {
                       const ExecOneShotRequest& req) -> CommandResult {
     nlohmann::json body;
     body["cmd"] = req.cmd;
-    if (!req.args.empty()) body["args"] = req.args;
+    body["args"] = req.args;  // always present, an empty list when there are none: the same body for an empty and an absent list
     if (req.cwd) body["cwd"] = *req.cwd;
     if (req.timeoutMs) body["timeoutMs"] = *req.timeoutMs;
     nlohmann::json r = http->request(
