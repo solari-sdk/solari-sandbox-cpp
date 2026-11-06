@@ -212,7 +212,7 @@ json handleView(const Sandbox& s) {
 }
 
 const std::set<std::string>& supportedOps() {
-  static const std::set<std::string> ops = {"commands.run", "commands.runCancellable", "sandbox.create", "sandbox.createDesktop", "sandbox.get", "sandbox.pause", "sandbox.resume",
+  static const std::set<std::string> ops = {"git.status", "git.branches", "git.log", "commands.run", "commands.runCancellable", "sandbox.create", "sandbox.createDesktop", "sandbox.get", "sandbox.pause", "sandbox.resume",
                                             "sandbox.start", "sandbox.kill", "sandbox.connect"};
   return ops;
 }
@@ -234,6 +234,40 @@ json runOp(const std::string& op, const json& input, const std::string& baseUrl)
       json r = {{"sandboxId", v.sandboxId}, {"kind", v.kind}, {"state", v.state}};
       if (v.controlUrl) r["controlUrl"] = *v.controlUrl;
       return {{"result", r}};
+    }
+    if (op == "git.status" || op == "git.branches" || op == "git.log") {
+      auto s = c.create(base);
+      std::optional<std::string> cwd;
+      if (input.contains("cwd")) cwd = input["cwd"].get<std::string>();
+      if (op == "git.status") {
+        GitStatus st = s->git.status(cwd);
+        json entries = json::array();
+        for (const auto& e : st.entries) {
+          json v = {{"path", e.path}, {"index", std::string(1, e.index)}, {"worktree", std::string(1, e.worktree)}};
+          if (e.origPath) v["origPath"] = *e.origPath;
+          entries.push_back(v);
+        }
+        json r = {{"branch", st.branch}, {"detached", st.detached}, {"ahead", st.ahead}, {"behind", st.behind}, {"staged", st.staged},
+                  {"modified", st.modified}, {"untracked", st.untracked}, {"conflicted", st.conflicted}, {"clean", st.clean}, {"entries", entries}};
+        if (st.upstream) r["upstream"] = *st.upstream;
+        return {{"result", r}};
+      }
+      if (op == "git.branches") {
+        json list = json::array();
+        for (const auto& b : s->git.branches(cwd)) {
+          json v = {{"name", b.name}, {"commit", b.commit}, {"current", b.current}};
+          if (b.upstream) v["upstream"] = *b.upstream;
+          list.push_back(v);
+        }
+        return {{"result", {{"list", list}}}};
+      }
+      GitLogOptions lo;
+      lo.cwd = cwd;
+      if (input.contains("maxCount")) lo.maxCount = input["maxCount"].get<int>();
+      json list = json::array();
+      for (const auto& cm : s->git.log(lo))
+        list.push_back({{"hash", cm.hash}, {"author", cm.author}, {"email", cm.email}, {"date", cm.date}, {"message", cm.message}, {"body", cm.body}});
+      return {{"result", {{"list", list}}}};
     }
     if (op == "commands.run" || op == "commands.runCancellable") {
       auto s = c.create(base);
