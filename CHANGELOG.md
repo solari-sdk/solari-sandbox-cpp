@@ -12,8 +12,10 @@
 - `args` is always in the `/exec` body and in `cmd.start` (an empty list when there are none).
 
 ### Added
+- **`ValidationError`** (a `GatewayError`: status 400, code `"ValidationError"`) is thrown before any request when `user` is neither `root` nor a unix user name (`^[a-z_][a-z0-9_-]{0,31}$`) or `timeoutMs` is negative, the same error the gateway's `/exec` route gives, so a bad value fails the same way on both routes.
+- **A `409 HostCapabilityMissing` from `/exec` is retried once on the live connection.** It means the host pool lacks `exec.user` for the sandbox's default user and nothing ran; the live connection reaches the guest directly, which honours `user`.
 - **`CommandResult::oomKilled`**: true when the guest's memory watchdog killed the command (exit 137 alone is ambiguous). Always present.
-- **`CommandResult::stdoutBytes` / `stderrBytes`**: the exact output bytes. Exact on the live connection; on `/exec` the gateway has already turned the output into text, so they are that text's bytes.
+- **`CommandResult::stdoutBytes` / `stderrBytes`**: the exact output bytes. Exact on the live connection. On `/exec` they are exact when the gateway sends its `stdoutBase64` / `stderrBase64` fields (it does, once its guests have them, for output that is not valid UTF-8); until then they are the bytes of the lossy text.
 - `solari::utf8Lossy()` in `solari/util.hpp`.
 
 ## 0.4.0

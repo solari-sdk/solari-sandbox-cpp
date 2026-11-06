@@ -282,8 +282,33 @@ static CommandResult makeResult(int code, const std::string& out, const std::str
   return r;
 }
 
+// Validated BEFORE a transport is chosen, with the gateway's own wording and class, so a bad value fails the same way whether the
+// command would have gone over /exec (which answers 400 ValidationError) or the live connection (which accepts anything).
+static void validateRunOptions(const CommandOptions& opts) {
+  if (opts.timeoutMs && *opts.timeoutMs < 0)
+    throw ValidationError("timeoutMs must be at least 1000 (one second), or 0 for no deadline");
+  if (opts.user) {
+    const std::string& u = *opts.user;
+    bool ok = u == "root";
+    if (!ok && !u.empty() && u.size() <= 32 && ((u[0] >= 'a' && u[0] <= 'z') || u[0] == '_')) {
+      ok = true;
+      for (size_t i = 1; i < u.size(); i++) {
+        const char c = u[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) ok = false;
+      }
+    }
+    if (!ok) throw ValidationError("user: must be a unix user name or root");
+  }
+}
+
+// The one /exec refusal that proves nothing ran: the host pool lacks the exec.user capability.
+static bool isExecUserCapabilityMissing(const GatewayError& e) {
+  return e.status == 409 && e.code && *e.code == "HostCapabilityMissing";
+}
+
 CommandResult Sandbox::runCommand(const std::string& cmd,
                                   const CommandOptions& opts) {
+  validateRunOptions(opts);
   // One-shot HTTP fast path: plain run-to-completion, no streaming/env/user. Falls back to WS only when /exec is unavailable.
   // (A cancellable run always takes the control-channel path: the one-shot route has no command id to signal.)
   const bool restEligible = hooks_.exec && !opts.background && !opts.onStdout && !opts.onStderr && opts.env.empty() &&
@@ -317,8 +342,9 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
     try {
       return viaRest();
     } catch (const GatewayError& e) {
-      if (!isRouteUnavailable(e)) throw;
-      // else fall through to the WS path
+      // Fall back to the live connection only when /exec is unavailable, or the host refused with 409 HostCapabilityMissing (nothing
+      // ran, and the live connection reaches the guest directly, which honours `user`). Any other failure propagates.
+      if (!isRouteUnavailable(e) && !isExecUserCapabilityMissing(e)) throw;
     }
   }
 

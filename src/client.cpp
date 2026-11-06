@@ -53,8 +53,9 @@ static CommandResult parseCommandResult(const nlohmann::json& j) {
     r.stderr_ = j["stderr"].get<std::string>();
   if (j.contains("timedOut") && j["timedOut"].is_boolean()) r.timedOut = j["timedOut"].get<bool>();
   if (j.contains("oomKilled") && j["oomKilled"].is_boolean()) r.oomKilled = j["oomKilled"].get<bool>();
-  r.stdoutBytes = r.stdout_;
-  r.stderrBytes = r.stderr_;
+  // The gateway sends the exact bytes (base64) beside the text only when the text is lossy; prefer them.
+  r.stdoutBytes = j.contains("stdoutBase64") && j["stdoutBase64"].is_string() ? base64Decode(j["stdoutBase64"].get<std::string>()) : r.stdout_;
+  r.stderrBytes = j.contains("stderrBase64") && j["stderrBase64"].is_string() ? base64Decode(j["stderrBase64"].get<std::string>()) : r.stderr_;
   return r;
 }
 
