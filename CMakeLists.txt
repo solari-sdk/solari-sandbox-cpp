@@ -72,12 +72,13 @@ if(SOLARI_BUILD_TESTS)
   )
   FetchContent_MakeAvailable(doctest)
 
-  add_executable(solari_tests tests/test_main.cpp tests/test_contract_wire.cpp tests/test_start.cpp tests/test_empty_post.cpp tests/test_git_real.cpp tests/test_concurrency.cpp)
+  add_executable(solari_tests tests/test_conformance.cpp tests/test_main.cpp tests/test_contract_wire.cpp tests/test_start.cpp tests/test_empty_post.cpp tests/test_git_real.cpp tests/test_concurrency.cpp)
   target_link_libraries(solari_tests PRIVATE solari doctest::doctest)
   # The cross-language wire contract the TS reference SDK regenerates. Passed as a
   # path because ctest's working directory is the build tree, not this one.
   target_compile_definitions(solari_tests PRIVATE
-    SOLARI_CONTRACT_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/ts-request-fixtures.json")
+    SOLARI_CONTRACT_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/ts-request-fixtures.json"
+    SOLARI_CONFORMANCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/conformance")
 
   enable_testing()
   add_test(NAME solari_tests COMMAND solari_tests)

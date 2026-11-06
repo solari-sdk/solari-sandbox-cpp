@@ -454,3 +454,48 @@ TEST_CASE("live: headless sandbox has no stream URL") {
   reply("stdout=" + r.stdout_);
   CHECK(trim(r.stdout_) == "Linux");
 }
+
+// One live-staging smoke row of the conformance suite (tests/conformance): create -> get -> kill, then the id is gone. The mock rows
+// prove the bytes this SDK sends and how it maps answers; this proves the real gateway agrees with them. Staging or loopback only
+// (a prod key can never be used here); creates exactly one sandbox, tagged {owner: conformance-cpp, run: <id>}, and kills only that id.
+TEST_CASE("live: conformance smoke - create, get, kill, gone") {
+  if (!liveEnabled()) {
+    MESSAGE("skipping: set SOLARI_LIVE=1 (and SOLARI_API_KEY) to run live tests");
+    return;
+  }
+  const std::string key = envOr("SOLARI_API_KEY");
+  REQUIRE_MESSAGE(!key.empty(), "SOLARI_LIVE=1 but SOLARI_API_KEY is empty");
+  const std::string base = envOr("SOLARI_BASE_URL", kDefaultBaseUrl);
+  const bool stagingOrLoopback = base.find("://api-sta") != std::string::npos || base.find("://localhost") != std::string::npos ||
+                                 base.find("://127.0.0.1") != std::string::npos;
+  REQUIRE_MESSAGE(stagingOrLoopback, "the conformance smoke runs on staging (api-sta*) or loopback only, not " << base);
+
+  ClientOptions co;
+  co.apiKey = key;
+  co.baseUrl = base;
+  Client client(co);
+
+  const std::string run = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  CreateSandboxOptions opts;
+  opts.template_ = "base";
+  opts.metadata = {{"owner", "conformance-cpp"}, {"run", run}};
+  opts.timeoutMs = 120000;
+  auto sb = client.create(opts);
+  VmGuard guard{client, sb->id()};
+
+  SandboxView view = client.get(sb->id());
+  CHECK(view.sandboxId == sb->id());
+  CHECK(view.kind == "sandbox");
+  CHECK(!view.state.empty());
+
+  client.kill(sb->id());
+  guard.id.clear();
+  client.kill(sb->id());  // kill is idempotent
+  bool gone = false;
+  try {
+    client.get(sb->id());
+  } catch (const GatewayError& e) {
+    gone = e.status == 404;
+  }
+  CHECK_MESSAGE(gone, "GET after kill should be 404");
+}
