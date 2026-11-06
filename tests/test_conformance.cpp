@@ -149,7 +149,10 @@ json normalizeError(const std::exception& e) {
   json out = {{"type", "other:" + std::string(typeid(e).name())}, {"message", e.what()}};
   if (auto* g = dynamic_cast<const GatewayError*>(&e)) {
     out["type"] = "gateway";
-    if (dynamic_cast<const AuthError*>(g)) out["type"] = "auth";
+    if (auto* ns = dynamic_cast<const SandboxNotStoppedError*>(g)) {
+      out["type"] = "not_stopped";
+      if (ns->state) out["state"] = *ns->state;
+    } else if (dynamic_cast<const AuthError*>(g)) out["type"] = "auth";
     else if (dynamic_cast<const PlanError*>(g)) out["type"] = "plan";
     else if (dynamic_cast<const ConcurrencyLimitError*>(g)) out["type"] = "concurrency_limit";
     else if (dynamic_cast<const NoCapacityError*>(g)) out["type"] = "no_capacity";

@@ -941,7 +941,7 @@ TEST_CASE("newIdempotencyKey looks like a v4 UUID") {
 
 // Gateway status + body code -> typed error (PROTOCOL.md section 4).
 TEST_CASE("throwGatewayError dispatches on the body code first") {
-  enum class K { Auth, Plan, Concurrency, NoCapacity, Plain };
+  enum class K { Auth, Plan, Concurrency, NoCapacity, NotStopped, Plain };
   struct C { const char* id; int status; const char* code; K kind; };
   const C cases[] = {
       {"401", 401, "Unauthorized", K::Auth},
@@ -951,6 +951,10 @@ TEST_CASE("throwGatewayError dispatches on the body code first") {
       {"403-other", 403, "Forbidden", K::Plain},
       {"404", 404, "NotFound", K::Plain},
       {"409-sandbox-stopped", 409, "SandboxStopped", K::Plain},
+      {"409-not-stopped", 409, "NotStopped", K::NotStopped},
+      {"409-start-in-progress", 409, "StartInProgress", K::NotStopped},
+      {"409-host-capability-missing", 409, "HostCapabilityMissing", K::Plain},
+      {"409-snapshot-not-restorable", 409, "SnapshotNotRestorable", K::Plain},
       {"410-gone", 410, "SandboxGone", K::Plain},
       {"429-concurrency-cap", 429, "ConcurrencyLimitExceeded", K::Concurrency},
       {"429-no-code", 429, "", K::Concurrency},
@@ -985,8 +989,27 @@ TEST_CASE("throwGatewayError dispatches on the body code first") {
       CHECK((dynamic_cast<const PlanError*>(&e) != nullptr) == (c.kind == K::Plan));
       CHECK((dynamic_cast<const ConcurrencyLimitError*>(&e) != nullptr) == (c.kind == K::Concurrency));
       CHECK((dynamic_cast<const NoCapacityError*>(&e) != nullptr) == (c.kind == K::NoCapacity));
+      CHECK((dynamic_cast<const SandboxNotStoppedError*>(&e) != nullptr) == (c.kind == K::NotStopped));
     }
     CHECK(threw);
+  }
+}
+
+// `state` rides along on a NotStopped refusal when the gateway reports it, and is absent otherwise.
+TEST_CASE("SandboxNotStoppedError carries the sandbox state from the body") {
+  try {
+    throwGatewayError(409, json{{"code", "NotStopped"}, {"error", "not stopped"}, {"state", "paused"}});
+    FAIL("expected a throw");
+  } catch (const SandboxNotStoppedError& e) {
+    CHECK(e.status == 409);
+    REQUIRE(e.state.has_value());
+    CHECK(*e.state == "paused");
+  }
+  try {
+    throwGatewayError(409, json{{"code", "StartInProgress"}});
+    FAIL("expected a throw");
+  } catch (const SandboxNotStoppedError& e) {
+    CHECK(!e.state.has_value());
   }
 }
 

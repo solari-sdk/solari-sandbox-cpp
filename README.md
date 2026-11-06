@@ -145,7 +145,8 @@ All failures throw exceptions derived from `solari::Error` (which is a
 
 - `GatewayError` (with `status` / `code` / `body`) and its typed subclasses
   `AuthError` (401), `PlanError` (402, or 403 `NotEntitled`), `ConcurrencyLimitError` (429 `ConcurrencyLimitExceeded`),
-  `NoCapacityError` (503 `NoCapacity` / `StartTimeout`); other 403/429/503 codes are a plain `GatewayError`
+  `NoCapacityError` (503 `NoCapacity` / `StartTimeout`), `SandboxNotStoppedError` (409 `NotStopped` / `StartInProgress` from `start()`;
+  `code` says which, `state` is the sandbox's current state when the gateway reports it); other 403/409/429/503 codes are a plain `GatewayError`
 - `ActionError` (an RPC replied `ok:false`), `TimeoutError`, `ConnectionError`
 
 ## Testing

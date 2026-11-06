@@ -76,6 +76,26 @@ class NoCapacityError : public GatewayError {
       : GatewayError(503, msg, std::move(b)) {}
 };
 
+/**
+ * HTTP 409 {code:"NotStopped"} or {code:"StartInProgress"} from `start`. NotStopped: the sandbox is in
+ * another state (use `resume()` for a paused one). StartInProgress: a start is already under way, so
+ * poll until the sandbox is running. Not retryable as-is. `state` is the sandbox's current state when
+ * the gateway reports it. Host refusals (StoppedDiskMissing, GoldenMismatch, HostCapabilityMissing, ...)
+ * stay plain GatewayError with the host's `code`. Mirrors `SandboxNotStoppedError` in the TS and Python SDKs.
+ */
+class SandboxNotStoppedError : public GatewayError {
+ public:
+  std::optional<std::string> state;
+
+  explicit SandboxNotStoppedError(const std::string& msg = "Sandbox is not stopped",
+                                  nlohmann::json b = nlohmann::json())
+      : GatewayError(409, msg, std::move(b)) {
+    if (body.is_object() && body.contains("state") && body["state"].is_string()) {
+      state = body["state"].get<std::string>();
+    }
+  }
+};
+
 /** A control-WS RPC returned `{ok:false}`. */
 class ActionError : public Error {
  public:
