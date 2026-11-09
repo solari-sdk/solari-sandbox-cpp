@@ -160,6 +160,13 @@ json normalizeError(const std::exception& e) {
     if (g->code) out["code"] = *g->code;
     if (g->body.is_object() && g->body.contains("retryable")) out["retryable"] = g->body["retryable"];
   }
+  if (dynamic_cast<const ValidationError*>(&e)) out["type"] = "validation";
+  if (auto* a = dynamic_cast<const ActionError*>(&e)) {
+    out["type"] = "action";
+    if (a->code) out["code"] = *a->code;
+  } else if (dynamic_cast<const ConnectionError*>(&e)) {
+    out["type"] = "connection";
+  }
   return out;
 }
 
@@ -205,7 +212,7 @@ json handleView(const Sandbox& s) {
 }
 
 const std::set<std::string>& supportedOps() {
-  static const std::set<std::string> ops = {"sandbox.create", "sandbox.createDesktop", "sandbox.get", "sandbox.pause", "sandbox.resume",
+  static const std::set<std::string> ops = {"git.status", "git.branches", "git.log", "commands.run", "commands.runCancellable", "sandbox.create", "sandbox.createDesktop", "sandbox.get", "sandbox.pause", "sandbox.resume",
                                             "sandbox.start", "sandbox.kill", "sandbox.connect"};
   return ops;
 }
@@ -228,6 +235,53 @@ json runOp(const std::string& op, const json& input, const std::string& baseUrl)
       if (v.controlUrl) r["controlUrl"] = *v.controlUrl;
       return {{"result", r}};
     }
+    if (op == "git.status" || op == "git.branches" || op == "git.log") {
+      auto s = c.create(base);
+      std::optional<std::string> cwd;
+      if (input.contains("cwd")) cwd = input["cwd"].get<std::string>();
+      if (op == "git.status") {
+        GitStatus st = s->git.status(cwd);
+        json entries = json::array();
+        for (const auto& e : st.entries) {
+          json v = {{"path", e.path}, {"index", std::string(1, e.index)}, {"worktree", std::string(1, e.worktree)}};
+          if (e.origPath) v["origPath"] = *e.origPath;
+          entries.push_back(v);
+        }
+        json r = {{"branch", st.branch}, {"detached", st.detached}, {"ahead", st.ahead}, {"behind", st.behind}, {"staged", st.staged},
+                  {"modified", st.modified}, {"untracked", st.untracked}, {"conflicted", st.conflicted}, {"clean", st.clean}, {"entries", entries}};
+        if (st.upstream) r["upstream"] = *st.upstream;
+        return {{"result", r}};
+      }
+      if (op == "git.branches") {
+        json list = json::array();
+        for (const auto& b : s->git.branches(cwd)) {
+          json v = {{"name", b.name}, {"commit", b.commit}, {"current", b.current}};
+          if (b.upstream) v["upstream"] = *b.upstream;
+          list.push_back(v);
+        }
+        return {{"result", {{"list", list}}}};
+      }
+      GitLogOptions lo;
+      lo.cwd = cwd;
+      if (input.contains("maxCount")) lo.maxCount = input["maxCount"].get<int>();
+      json list = json::array();
+      for (const auto& cm : s->git.log(lo))
+        list.push_back({{"hash", cm.hash}, {"author", cm.author}, {"email", cm.email}, {"date", cm.date}, {"message", cm.message}, {"body", cm.body}});
+      return {{"result", {{"list", list}}}};
+    }
+    if (op == "commands.run" || op == "commands.runCancellable") {
+      auto s = c.create(base);
+      CommandOptions o;
+      if (input.contains("args")) o.args = input["args"].get<std::vector<std::string>>();
+      if (input.contains("timeoutMs")) o.timeoutMs = input["timeoutMs"].get<long>();
+      // via "ws": a non-empty env forces the live control connection; via "rest": nothing does (no channel, no env).
+      if (input.value("via", "rest") == "ws") o.env = {{"SOLARI_CONFORMANCE", "1"}};
+      if (input.contains("user")) o.user = input["user"].get<std::string>();
+      // A call the caller can cancel (a cancel token) must run on the live connection: aborting a one-shot /exec leaves the process.
+      if (op == "commands.runCancellable") o.cancel = std::make_shared<CancelToken>();
+      CommandResult r = s->commands.run(input["cmd"].get<std::string>(), o);
+      return {{"result", {{"exitCode", r.exitCode}, {"stdout", r.stdout_}, {"stderr", r.stderr_}, {"timedOut", r.timedOut}, {"oomKilled", r.oomKilled}, {"stdoutBase64", base64Encode(r.stdoutBytes)}}}};
+    }
     auto s = c.create(base);
     if (op == "sandbox.pause") s->pause();
     else if (op == "sandbox.resume") s->resume();
@@ -244,7 +298,8 @@ json runOp(const std::string& op, const json& input, const std::string& baseUrl)
 std::string checkRow(Mock& mock, const json& row) {
   mock.control("POST", "/__reset");
   std::string mockJson = replaceAll(replaceAll(row.value("mock", json::array()).dump(), "$MOCK_WS", replaceAll(mock.url, "http", "ws")), "$MOCK_URL", mock.url);
-  json armed = mock.control("POST", "/__arm", json{{"mock", json::parse(mockJson)}}.dump());
+  const bool strict = row.contains("expect") && row["expect"].contains("wsCalls");
+  json armed = mock.control("POST", "/__arm", json{{"mock", json::parse(mockJson)}, {"ws", row.value("ws", json::array())}, {"strict", strict}}.dump());
   if (!armed.value("ok", false)) return "could not arm the mock: " + armed.dump();
   json out = runOp(row["op"], row.value("input", json::object()), mock.url);
   json log = mock.control("GET", "/__log");
@@ -269,6 +324,8 @@ std::string checkRow(Mock& mock, const json& row) {
   }
   if (exp.contains("requests") && requests != exp["requests"].get<int>())
     return "expected " + std::to_string(exp["requests"].get<int>()) + " request(s), made " + std::to_string(requests);
+  if (exp.contains("wsCalls") && static_cast<int>(log["wsCalls"].size()) != exp["wsCalls"].get<int>())
+    return "expected " + std::to_string(exp["wsCalls"].get<int>()) + " control call(s), made " + std::to_string(log["wsCalls"].size());
   if (log["remaining"].get<int>() != 0) return std::to_string(log["remaining"].get<int>()) + " scripted exchange(s) never happened";
   return "";
 }

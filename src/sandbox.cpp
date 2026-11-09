@@ -144,12 +144,23 @@ CommandHandle Sandbox::startCommandTapped(
     const std::string& cmd, const CommandOptions& opts,
     std::function<void(const std::string&, const std::string&)> tap) {
   nlohmann::json params = {{"cmd", cmd}};
-  if (!opts.args.empty()) params["args"] = opts.args;
+  params["args"] = opts.args;  // always present, an empty list when there are none (the same as the /exec body)
   if (opts.cwd) params["cwd"] = *opts.cwd;
   if (!opts.env.empty()) params["env"] = opts.env;
   if (opts.user) params["user"] = *opts.user;
 
-  nlohmann::json r = channel_->call("cmd.start", params, timeout());
+  // A command that needs the live connection (env, user, callbacks, a cancel token, background) opens it on demand, as the REST
+  // route is chosen without the caller doing anything: the transport is not something the caller has to manage.
+  if (!channel_->connected()) connect();
+  nlohmann::json r;
+  try {
+    r = channel_->call("cmd.start", params, timeout());
+  } catch (const ActionError& e) {
+    // The guest's refusal carries no code. A spawn failure (fork/exec ..., chdir ...) is ExecFailed, the code /exec reports for it.
+    const std::string m = e.what();
+    if (!e.code && (m.rfind("fork/exec ", 0) == 0 || m.rfind("chdir ", 0) == 0)) throw ActionError(e.method, m, std::string("ExecFailed"));
+    throw;
+  }
   std::string cmdId = r.at("cmdId").get<std::string>();
 
   auto st = std::make_shared<CmdState>();
@@ -259,8 +270,45 @@ static bool isSharedRefusal(const ActionError& e) {
          m.find("not available on a shared") != std::string::npos;
 }
 
+// The result of a command run on the control connection: text decoded as UTF-8 over each whole stream, plus the exact bytes.
+static CommandResult makeResult(int code, const std::string& out, const std::string& err, bool timedOut = false) {
+  CommandResult r;
+  r.exitCode = code;
+  r.stdout_ = utf8Lossy(out);
+  r.stderr_ = utf8Lossy(err);
+  r.timedOut = timedOut;
+  r.stdoutBytes = out;
+  r.stderrBytes = err;
+  return r;
+}
+
+// Validated BEFORE a transport is chosen, with the gateway's own wording and class, so a bad value fails the same way whether the
+// command would have gone over /exec (which answers 400 ValidationError) or the live connection (which accepts anything).
+static void validateRunOptions(const CommandOptions& opts) {
+  if (opts.timeoutMs && *opts.timeoutMs < 0)
+    throw ValidationError("timeoutMs must be at least 1000 (one second), or 0 for no deadline");
+  if (opts.user) {
+    const std::string& u = *opts.user;
+    bool ok = u == "root";
+    if (!ok && !u.empty() && u.size() <= 32 && ((u[0] >= 'a' && u[0] <= 'z') || u[0] == '_')) {
+      ok = true;
+      for (size_t i = 1; i < u.size(); i++) {
+        const char c = u[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) ok = false;
+      }
+    }
+    if (!ok) throw ValidationError("user: must be a unix user name or root");
+  }
+}
+
+// The one /exec refusal that proves nothing ran: the host pool lacks the exec.user capability.
+static bool isExecUserCapabilityMissing(const GatewayError& e) {
+  return e.status == 409 && e.code && *e.code == "HostCapabilityMissing";
+}
+
 CommandResult Sandbox::runCommand(const std::string& cmd,
                                   const CommandOptions& opts) {
+  validateRunOptions(opts);
   // One-shot HTTP fast path: plain run-to-completion, no streaming/env/user. Falls back to WS only when /exec is unavailable.
   // (A cancellable run always takes the control-channel path: the one-shot route has no command id to signal.)
   const bool restEligible = hooks_.exec && !opts.background && !opts.onStdout && !opts.onStderr && opts.env.empty() &&
@@ -271,7 +319,22 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
     req.args = opts.args;
     if (opts.cwd) req.cwd = opts.cwd;
     if (opts.timeoutMs) req.timeoutMs = opts.timeoutMs;
-    return hooks_.exec(id_, req);
+    try {
+      return hooks_.exec(id_, req);
+    } catch (const GatewayError& e) {
+      // Make an /exec answer indistinguishable from the same command on the live connection. A deadline that fired below the
+      // guest (400 ExecTimeout, or the guest's vsock read timeout as 502 "... i/o timeout") is the elapsed-deadline RESULT, never
+      // an error; a command that cannot start is the action error cmd.start / ExecFailed, as on the live connection.
+      const std::string msg = e.what();
+      if ((e.status == 400 && e.code && *e.code == "ExecTimeout") || (e.status == 502 && msg.find("i/o timeout") != std::string::npos)) {
+        CommandResult r;
+        r.exitCode = -1;
+        r.timedOut = true;
+        return r;
+      }
+      if (e.status == 400 && e.code && *e.code == "ExecFailed") throw ActionError("cmd.start", msg, std::string("ExecFailed"));
+      throw;
+    }
   };
   // A shared sandbox refuses command streams (cmd.start) but runs commands over REST, so once we know the sandbox is shared
   // the REST route is the only one that works, whether or not the control channel is open.
@@ -279,8 +342,9 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
     try {
       return viaRest();
     } catch (const GatewayError& e) {
-      if (!isRouteUnavailable(e)) throw;
-      // else fall through to the WS path
+      // Fall back to the live connection only when /exec is unavailable, or the host refused with 409 HostCapabilityMissing (nothing
+      // ran, and the live connection reaches the guest directly, which honours `user`). Any other failure propagates.
+      if (!isRouteUnavailable(e) && !isExecUserCapabilityMissing(e)) throw;
     }
   }
 
@@ -314,12 +378,12 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
         h.kill(9);
       } catch (const Error&) {
       }
-      return CommandResult{-1, *out, *err, true};
+      return makeResult(-1, *out, *err, true);
     }
-    return CommandResult{*code, *out, *err};
+    return makeResult(*code, *out, *err);
   }
   int code = h.wait();
-  return CommandResult{code, *out, *err};
+  return makeResult(code, *out, *err);
 }
 
 // What a cancelled run does to the guest process: SIGTERM and a closed stdin now, SIGKILL after kCancelKillGraceMs if it has
@@ -364,11 +428,11 @@ CommandResult Sandbox::waitCancellable(CommandHandle& h, const CommandOptions& o
           h.kill(9);
         } catch (const Error&) {
         }
-        return CommandResult{-1, *out, *err, true};
+        return makeResult(-1, *out, *err, true);
       }
       slice = std::min(slice, left);
     }
-    if (std::optional<int> code = h.waitFor(slice)) return CommandResult{*code, *out, *err};
+    if (std::optional<int> code = h.waitFor(slice)) return makeResult(*code, *out, *err);
   }
 }
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0
+
+`commands.run` now behaves the same over the one-shot `/exec` route and the live control connection (the shared conformance rows in `tests/conformance/spec/commands.json` pin it; before this release 13 of them failed for this SDK).
+
+### Changed
+- **A command that needs the live connection opens it by itself.** `env`, `user`, callbacks, a cancel token or `background` used to throw "Not connected — call connect() first" on a sandbox whose channel was not open yet, and so did the fall back to the control connection when the gateway does not serve `/exec`. They now connect on demand, as the REST route is chosen without the caller doing anything.
+- **A deadline that fires below the guest is a result, not an error.** `400 ExecTimeout` and the guest's hidden vsock read timeout (`502 ... i/o timeout`) on `/exec` now return `CommandResult{exitCode -1, timedOut true}`, the same result the live connection gives when `timeoutMs` elapses.
+- **A command that cannot start is one error on both routes:** `ActionError` with `method "cmd.start"` and `code "ExecFailed"`. `/exec` reports it as a `400 ExecFailed` gateway error, which used to come back as `GatewayError`; the live connection's refusal carries no code, and `fork/exec ...` / `chdir ...` now get `ExecFailed`.
+- **`stdout_` / `stderr_` are UTF-8 text** decoded over the whole stream (a character split across two chunks survives; invalid bytes become U+FFFD; NUL is kept). They used to be the raw bytes on the live connection, which is not valid JSON or text for a binary command. Read exact bytes from the new `stdoutBytes` / `stderrBytes`. Callbacks still receive the raw chunks.
+- `args` is always in the `/exec` body and in `cmd.start` (an empty list when there are none).
+
+### Fixed
+- **`git.status()`, `branches()` and `log()` no longer lose information** (they ran against real git for the first time in this release's tests). `status` uses `--porcelain=v1 -z --branch --untracked-files=all`: paths are verbatim (not quoted or escaped), a rename is its NEW path with the old one in `entries[].origPath`, an untracked directory lists its files, a merge conflict is listed once in `conflicted` (not as staged and modified), and `upstream`, `ahead`/`behind` (also `[gone]`) and a detached HEAD are read correctly. New fields: `GitStatus::upstream`, `conflicted`, `entries` (`GitStatusEntry`). `branches` uses `for-each-ref refs/heads`: a detached HEAD is no longer a branch named `(HEAD detached at ...)` and nothing is current then; `GitBranch::upstream` is new. `log` keeps the message body (`GitCommit::body`, `message` is the subject), splits records on `\x1e` so a multi-line body stays with its commit, and a repository with no commit returns an empty list instead of throwing.
+
+### Added
+- **`ValidationError`** (a `GatewayError`: status 400, code `"ValidationError"`) is thrown before any request when `user` is neither `root` nor a unix user name (`^[a-z_][a-z0-9_-]{0,31}$`) or `timeoutMs` is negative, the same error the gateway's `/exec` route gives, so a bad value fails the same way on both routes.
+- **A `409 HostCapabilityMissing` from `/exec` is retried once on the live connection.** It means the host pool lacks `exec.user` for the sandbox's default user and nothing ran; the live connection reaches the guest directly, which honours `user`.
+- **`CommandResult::oomKilled`**: true when the guest's memory watchdog killed the command (exit 137 alone is ambiguous). Always present.
+- **`CommandResult::stdoutBytes` / `stderrBytes`**: the exact output bytes. Exact on the live connection. On `/exec` they are exact when the gateway sends its `stdoutBase64` / `stderrBase64` fields (it does, once its guests have them, for output that is not valid UTF-8); until then they are the bytes of the lossy text.
+- `solari::utf8Lossy()` in `solari/util.hpp`.
+
 ## 0.4.0
 
 ### Added

@@ -40,6 +40,13 @@ struct CommandResult {
   std::string stderr_;
   /** True when the command hit its `timeoutMs` and was killed (`exitCode` is -1 then). */
   bool timedOut = false;
+  /** True when the guest's memory watchdog killed the command (exit 137 alone is ambiguous). Always present. */
+  bool oomKilled = false;
+  /** The exact output bytes. `stdout_` / `stderr_` are UTF-8 text (invalid bytes become U+FFFD, decoded over the whole stream); a
+   *  command that prints binary data is read from these. Exact on the control connection; on the one-shot `/exec` route the gateway
+   *  has already turned the output into text, so these are that text's bytes. */
+  std::string stdoutBytes;
+  std::string stderrBytes;
 };
 
 /** Options for `commands.run` / `commands.start`. */
@@ -136,14 +143,36 @@ struct RunCodeOptions {
 
 // --- git --------------------------------------------------------------------
 
+/** One `git status --porcelain=v1 -z` record. */
+struct GitStatusEntry {
+  /** The path, verbatim (not quoted or escaped); for a rename or copy the NEW path. */
+  std::string path;
+  /** The old path of a rename or copy. */
+  std::optional<std::string> origPath;
+  /** The index (staged) column: ' ', 'M', 'A', 'D', 'R', 'C', 'U', or '?' for an untracked file. */
+  char index = ' ';
+  /** The worktree (unstaged) column, same alphabet. */
+  char worktree = ' ';
+};
+
 struct GitStatus {
   std::string branch;
+  /** The upstream branch (`origin/main`), when one is configured (also when it is gone). */
+  std::optional<std::string> upstream;
   bool detached = false;
   int ahead = 0;
   int behind = 0;
+  /** Paths with a staged change (index column not blank); a rename is its NEW path. Never a conflicted path. */
   std::vector<std::string> staged;
+  /** Paths with an unstaged change (worktree column not blank). Never a conflicted path. */
   std::vector<std::string> modified;
+  /** Untracked files, one per file (never a bare directory). */
   std::vector<std::string> untracked;
+  /** Paths in an unmerged state (DD AU UD UA DU AA UU), each listed once and only here. */
+  std::vector<std::string> conflicted;
+  /** Every record `git status` printed, in order, with its two status columns. */
+  std::vector<GitStatusEntry> entries;
+  /** True when there are no entries at all. */
   bool clean = true;
 };
 
@@ -151,6 +180,8 @@ struct GitBranch {
   std::string name;
   std::string commit;
   bool current = false;
+  /** The upstream branch, when one is set. */
+  std::optional<std::string> upstream;
 };
 
 struct GitCommit {
@@ -158,7 +189,10 @@ struct GitCommit {
   std::string author;
   std::string email;
   std::string date;
+  /** The subject line. */
   std::string message;
+  /** The rest of the message, without trailing newlines; empty when there is none. */
+  std::string body;
 };
 
 struct GitCommitResult {

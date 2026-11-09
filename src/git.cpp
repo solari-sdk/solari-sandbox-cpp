@@ -112,61 +112,92 @@ void GitOps::clone(const std::string& url, const GitCloneOptions& opts) {
   mustGit(args, opts.cwd, auth.env, opts.password.value_or(""));
 }
 
-GitStatus GitOps::status(std::optional<std::string> cwd) {
-  std::string out = mustGit({"status", "--porcelain=v1", "--branch"}, cwd);
-  GitStatus st;
-  st.clean = true;
-  std::size_t start = 0;
-  while (start <= out.size()) {
-    auto nl = out.find('\n', start);
-    std::string line =
-        out.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
-    if (nl == std::string::npos) start = out.size() + 1;
-    else start = nl + 1;
-    if (line.empty()) continue;
+static std::vector<std::string> splitOn(const std::string& s, char sep) {
+  std::vector<std::string> out;
+  std::size_t p = 0;
+  while (true) {
+    auto q = s.find(sep, p);
+    if (q == std::string::npos) {
+      out.push_back(s.substr(p));
+      return out;
+    }
+    out.push_back(s.substr(p, q - p));
+    p = q + 1;
+  }
+}
 
-    if (line.rfind("## ", 0) == 0) {
-      std::string head = line.substr(3);
-      if (head.rfind("HEAD (no branch)", 0) == 0) {
-        st.detached = true;
-      } else {
-        std::string body = head;
-        std::smatch m;
-        std::regex noCommits("^No commits yet on (.+)$");
-        if (std::regex_match(head, m, noCommits)) body = m[1].str();
-        // branch = body before "..." then before " "
-        std::string branch = body;
-        auto dots = branch.find("...");
-        if (dots != std::string::npos) branch = branch.substr(0, dots);
-        auto sp = branch.find(' ');
-        if (sp != std::string::npos) branch = branch.substr(0, sp);
-        st.branch = branch;
-        std::smatch ab;
-        if (std::regex_search(head, ab, std::regex("\\[(.*)\\]"))) {
-          std::string inner = ab[1].str();
-          std::smatch a, b;
-          if (std::regex_search(inner, a, std::regex("ahead (\\d+)")))
-            st.ahead = std::stoi(a[1].str());
-          if (std::regex_search(inner, b, std::regex("behind (\\d+)")))
-            st.behind = std::stoi(b[1].str());
-        }
-      }
+static int numberAfter(const std::string& s, const std::string& marker) {
+  auto at = s.find(marker);
+  if (at == std::string::npos) return 0;
+  return std::atoi(s.c_str() + at + marker.size());
+}
+
+/** `main...origin/main [ahead 1, behind 2]` | `main...origin/main [gone]` | `main` | `No commits yet on main` | `HEAD (no branch)`. */
+static void parseStatusHeader(std::string head, GitStatus& st) {
+  if (head.rfind("HEAD (no branch)", 0) == 0) {
+    st.detached = true;
+    return;
+  }
+  for (const char* prefix : {"No commits yet on ", "Initial commit on "})
+    if (head.rfind(prefix, 0) == 0) head = head.substr(std::string(prefix).size());
+  std::string refs = head, counts;
+  auto br = head.find(" [");
+  if (br != std::string::npos) {
+    refs = head.substr(0, br);
+    counts = head.substr(br + 2);
+  }
+  auto dots = refs.find("...");
+  if (dots != std::string::npos) {
+    st.branch = refs.substr(0, dots);
+    st.upstream = refs.substr(dots + 3);
+  } else {
+    st.branch = refs;
+  }
+  st.ahead = numberAfter(counts, "ahead ");
+  st.behind = numberAfter(counts, "behind ");
+}
+
+/** Parse `git status --porcelain=v1 -z --branch --untracked-files=all`: NUL-terminated records, the first `## branch...upstream
+ *  [ahead N, behind M]`, then `XY path`, where a rename or copy (X or Y is R/C) is followed by one more record holding the ORIGINAL
+ *  path. Paths are verbatim (-z turns quoting off). */
+static GitStatus parseStatus(const std::string& out) {
+  GitStatus st;
+  std::vector<std::string> recs;
+  for (auto& r : splitOn(out, '\0'))
+    if (!r.empty()) recs.push_back(std::move(r));
+  for (std::size_t i = 0; i < recs.size(); i++) {
+    const std::string& rec = recs[i];
+    if (rec.rfind("## ", 0) == 0) {
+      parseStatusHeader(rec.substr(3), st);
       continue;
     }
-
-    std::string xy = line.substr(0, 2);
-    std::string path = line.size() > 3 ? line.substr(3) : "";
-    if (xy == "??") {
-      st.untracked.push_back(path);
-    } else if (xy.size() == 2) {
-      char index = xy[0];
-      char work = xy[1];
-      if (index != ' ' && index != '?') st.staged.push_back(path);
-      if (work != ' ' && work != '?') st.modified.push_back(path);
+    if (rec.size() < 3) continue;
+    const char x = rec[0], y = rec[1];
+    GitStatusEntry e;
+    e.path = rec.substr(3);
+    e.index = x;
+    e.worktree = y;
+    if (x == 'R' || x == 'C' || y == 'R' || y == 'C') {
+      if (i + 1 < recs.size()) e.origPath = recs[++i];
     }
+    if (x == '!' && y == '!') continue;  // ignored files are not part of the status
+    const std::string xy{x, y};
+    if (xy == "??") {
+      st.untracked.push_back(e.path);
+    } else if (xy == "DD" || xy == "AU" || xy == "UD" || xy == "UA" || xy == "DU" || xy == "AA" || xy == "UU") {
+      st.conflicted.push_back(e.path);
+    } else {
+      if (x != ' ') st.staged.push_back(e.path);
+      if (y != ' ') st.modified.push_back(e.path);
+    }
+    st.entries.push_back(std::move(e));
   }
-  st.clean = st.staged.empty() && st.modified.empty() && st.untracked.empty();
+  st.clean = st.entries.empty();
   return st;
+}
+
+GitStatus GitOps::status(std::optional<std::string> cwd) {
+  return parseStatus(mustGit({"status", "--porcelain=v1", "-z", "--branch", "--untracked-files=all"}, cwd));
 }
 
 void GitOps::add(const std::vector<std::string>& paths,
@@ -231,70 +262,58 @@ void GitOps::checkout(const std::string& ref, const GitCheckoutOptions& opts) {
 }
 
 std::vector<GitBranch> GitOps::branches(std::optional<std::string> cwd) {
+  // for-each-ref lists real branches only: a detached HEAD has no refs/heads entry, so it is not a branch and nothing is current.
   std::string out = mustGit(
-      {"branch", "--format=%(HEAD)%1f%(refname:short)%1f%(objectname:short)"}, cwd);
+      {"for-each-ref", "--format=%(HEAD)%1f%(refname:short)%1f%(objectname:short)%1f%(upstream:short)", "refs/heads"}, cwd);
   std::vector<GitBranch> branches;
-  std::size_t start = 0;
-  while (start <= out.size()) {
-    auto nl = out.find('\n', start);
-    std::string line =
-        out.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
-    if (nl == std::string::npos) start = out.size() + 1;
-    else start = nl + 1;
-    if (trim(line).empty()) continue;
-    // split on \x1f into [head, name, commit]
-    std::vector<std::string> f;
-    std::size_t p = 0;
-    while (true) {
-      auto q = line.find('\x1f', p);
-      if (q == std::string::npos) {
-        f.push_back(line.substr(p));
-        break;
-      }
-      f.push_back(line.substr(p, q - p));
-      p = q + 1;
-    }
+  for (const std::string& line : splitOn(out, '\n')) {
+    if (line.empty()) continue;
+    std::vector<std::string> f = splitOn(line, '\x1f');
     GitBranch b;
-    b.current = f.size() > 0 && f[0] == "*";
+    b.current = !f.empty() && f[0] == "*";
     b.name = f.size() > 1 ? f[1] : "";
     b.commit = f.size() > 2 ? f[2] : "";
-    branches.push_back(b);
+    if (f.size() > 3 && !f[3].empty()) b.upstream = f[3];
+    branches.push_back(std::move(b));
   }
   return branches;
 }
 
 std::vector<GitCommit> GitOps::log(const GitLogOptions& opts) {
-  std::vector<std::string> args = {"log", "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%s"};
+  std::vector<std::string> args = {"log", "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1e"};
   if (opts.maxCount && *opts.maxCount > 0)
     args.push_back("--max-count=" + std::to_string(*opts.maxCount));
-  std::string out = mustGit(args, opts.cwd);
+  std::string out;
+  try {
+    out = mustGit(args, opts.cwd);
+  } catch (const Error& e) {
+    // A repository with no commit yet is an empty history, not an error.
+    if (std::string(e.what()).find("does not have any commits yet") != std::string::npos) return {};
+    throw;
+  }
+  // Records end with \x1e, fields with \x1f, so a multi-line body belongs to its own commit.
   std::vector<GitCommit> commits;
-  std::size_t start = 0;
-  while (start <= out.size()) {
-    auto nl = out.find('\n', start);
-    std::string line =
-        out.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
-    if (nl == std::string::npos) start = out.size() + 1;
-    else start = nl + 1;
-    if (trim(line).empty()) continue;
+  for (std::string rec : splitOn(out, '\x1e')) {
+    while (!rec.empty() && rec.front() == '\n') rec.erase(rec.begin());
+    if (rec.empty()) continue;
     std::vector<std::string> f;
     std::size_t p = 0;
-    while (true) {
-      auto q = line.find('\x1f', p);
-      if (q == std::string::npos) {
-        f.push_back(line.substr(p));
-        break;
-      }
-      f.push_back(line.substr(p, q - p));
+    for (int i = 0; i < 5; i++) {  // five fields end at \x1f; the rest (the body) may itself hold anything but \x1e
+      auto q = rec.find('\x1f', p);
+      if (q == std::string::npos) break;
+      f.push_back(rec.substr(p, q - p));
       p = q + 1;
     }
+    f.push_back(p <= rec.size() ? rec.substr(p) : "");
     GitCommit c;
     c.hash = f.size() > 0 ? f[0] : "";
     c.author = f.size() > 1 ? f[1] : "";
     c.email = f.size() > 2 ? f[2] : "";
     c.date = f.size() > 3 ? f[3] : "";
     c.message = f.size() > 4 ? f[4] : "";
-    commits.push_back(c);
+    c.body = f.size() > 5 ? f[5] : "";
+    while (!c.body.empty() && c.body.back() == '\n') c.body.pop_back();
+    commits.push_back(std::move(c));
   }
   return commits;
 }

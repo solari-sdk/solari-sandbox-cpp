@@ -96,4 +96,40 @@ std::string trim(const std::string& s) {
   return s.substr(b, e - b);
 }
 
+
+std::string utf8Lossy(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  const auto* p = reinterpret_cast<const unsigned char*>(in.data());
+  const size_t n = in.size();
+  size_t i = 0;
+  auto cont = [&](size_t at, unsigned lo = 0x80, unsigned hi = 0xBF) { return at < n && p[at] >= lo && p[at] <= hi; };
+  while (i < n) {
+    const unsigned c = p[i];
+    size_t len = 0;
+    if (c < 0x80) {
+      len = 1;
+    } else if (c >= 0xC2 && c <= 0xDF) {
+      if (cont(i + 1)) len = 2;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+      const unsigned lo = c == 0xE0 ? 0xA0 : 0x80, hi = c == 0xED ? 0x9F : 0xBF;
+      if (cont(i + 1, lo, hi) && cont(i + 2)) len = 3;
+      else if (cont(i + 1, lo, hi)) { out += "\xEF\xBF\xBD"; i += 2; continue; }
+    } else if (c >= 0xF0 && c <= 0xF4) {
+      const unsigned lo = c == 0xF0 ? 0x90 : 0x80, hi = c == 0xF4 ? 0x8F : 0xBF;
+      if (cont(i + 1, lo, hi) && cont(i + 2) && cont(i + 3)) len = 4;
+      else if (cont(i + 1, lo, hi) && cont(i + 2)) { out += "\xEF\xBF\xBD"; i += 3; continue; }
+      else if (cont(i + 1, lo, hi)) { out += "\xEF\xBF\xBD"; i += 2; continue; }
+    }
+    if (len == 0) {
+      out += "\xEF\xBF\xBD";
+      i += 1;
+    } else {
+      out.append(in, i, len);
+      i += len;
+    }
+  }
+  return out;
+}
+
 } // namespace solari

@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <fstream>
@@ -379,4 +380,178 @@ TEST_CASE("real git: a redirect to another host never receives the password; --u
   CHECK_THROWS_AS(git.clone("--upload-pack=touch " + mark, hostile), Error);
   CHECK(access(mark.c_str(), F_OK) != 0);
   std::system(("rm -rf '" + dir + "'").c_str());
+}
+
+// ---- status / branches / log against REAL git (no stub output) -------------------------------------------------------------
+// The parsers used to lose information: quoted paths, a rename as one "old -> new" string, an untracked directory as "dir/", a
+// conflict listed as staged AND modified, a detached HEAD listed as a branch, log on a repository with no commit failing, and the
+// message body dropped.
+namespace {
+
+struct ParseRepo {
+  std::string dir, repo, home;
+  ParseRepo(const std::string& tag) {
+    dir = tempDir(tag);
+    repo = dir + "/repo";
+    home = dir + "/home";
+    std::system(("mkdir -p '" + repo + "' '" + home + "'").c_str());
+    g({"init", "-q", "-b", "main"});
+    g({"config", "user.name", "T"});
+    g({"config", "user.email", "t@e.x"});
+  }
+  std::string g(const std::vector<std::string>& args) {
+    std::vector<std::string> argv = {"git"};
+    argv.insert(argv.end(), args.begin(), args.end());
+    auto env = baseEnv();
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null";
+    env["GIT_CONFIG_SYSTEM"] = "/dev/null";
+    return runProc(argv, repo, env).out;  // exit status ignored: a merge conflict is the point of one test
+  }
+  void write(const std::string& name, const std::string& body) {
+    std::string p = repo + "/" + name;
+    auto slash = p.rfind('/');
+    std::system(("mkdir -p '" + p.substr(0, slash) + "'").c_str());
+    std::ofstream(p, std::ios::binary) << body;
+  }
+};
+
+std::vector<std::string> sortedCopy(std::vector<std::string> v) {
+  std::sort(v.begin(), v.end());
+  return v;
+}
+
+}  // namespace
+
+TEST_CASE("real git: an empty repository: log is empty, branches empty, status clean on the unborn branch") {
+  if (!haveGit()) return;
+  ParseRepo r("empty");
+  RealGit rg{r.home, {}, {}};
+  GitOps git([&](const std::string& c, const CommandOptions& o) { return rg.run(c, o); });
+  CHECK(git.log(GitLogOptions{r.repo, std::nullopt}).empty());
+  CHECK(git.branches(r.repo).empty());
+  GitStatus st = git.status(r.repo);
+  CHECK(st.branch == "main");
+  CHECK(st.clean);
+  CHECK(st.entries.empty());
+}
+
+TEST_CASE("real git: status paths are verbatim and an untracked directory lists its files") {
+  if (!haveGit()) return;
+  ParseRepo r("paths");
+  RealGit rg{r.home, {}, {}};
+  GitOps git([&](const std::string& c, const CommandOptions& o) { return rg.run(c, o); });
+  for (auto [n, b] : std::vector<std::pair<std::string, std::string>>{{"a b.txt", "1"}, {"\xC3\xA9 \xC3\xBC.txt", "2"}, {"tab\there", "3"}, {"nd/inner", "n"}, {"nd/deep file", "n"}})
+    r.write(n, b);
+  GitStatus st = git.status(r.repo);
+  CHECK(sortedCopy(st.untracked) == sortedCopy({"a b.txt", "\xC3\xA9 \xC3\xBC.txt", "tab\there", "nd/inner", "nd/deep file"}));
+}
+
+TEST_CASE("real git: a rename is the new path with the old path in entries; a deletion is staged; staged and modified stay separate") {
+  if (!haveGit()) return;
+  ParseRepo r("rename");
+  RealGit rg{r.home, {}, {}};
+  GitOps git([&](const std::string& c, const CommandOptions& o) { return rg.run(c, o); });
+  r.write("plain", "2");
+  r.write("gone me", "1");
+  r.g({"add", "-A"});
+  r.g({"commit", "-q", "-m", "first"});
+  r.write("plain", "2\nmore");
+  r.g({"mv", "plain", "renamed file"});
+  r.write("staged", "s");
+  r.g({"add", "staged"});
+  r.g({"rm", "-q", "--cached", "gone me"});
+  GitStatus st = git.status(r.repo);
+  CHECK(sortedCopy(st.staged) == sortedCopy({"gone me", "renamed file", "staged"}));
+  CHECK(st.modified == std::vector<std::string>{"renamed file"});  // RM: the rename is staged and the content changed again
+  const GitStatusEntry* ren = nullptr;
+  for (const auto& e : st.entries) if (e.path == "renamed file") ren = &e;
+  REQUIRE(ren != nullptr);
+  CHECK(ren->origPath.value_or("") == "plain");
+  CHECK(ren->index == 'R');
+  CHECK(ren->worktree == 'M');
+  for (const auto& p : st.staged) CHECK(p.find("->") == std::string::npos);
+}
+
+TEST_CASE("real git: a merge conflict is listed once, as conflicted") {
+  if (!haveGit()) return;
+  ParseRepo r("conflict");
+  RealGit rg{r.home, {}, {}};
+  GitOps git([&](const std::string& c, const CommandOptions& o) { return rg.run(c, o); });
+  r.write("base", "0");
+  r.g({"add", "-A"});
+  r.g({"commit", "-q", "-m", "base"});
+  r.g({"checkout", "-q", "-b", "c1"});
+  r.write("conflict", "A");
+  r.g({"add", "conflict"});
+  r.g({"commit", "-q", "-m", "c1"});
+  r.g({"checkout", "-q", "main"});
+  r.write("conflict", "B");
+  r.g({"add", "conflict"});
+  r.g({"commit", "-q", "-m", "c2"});
+  r.g({"merge", "c1"});
+  GitStatus st = git.status(r.repo);
+  CHECK(st.conflicted == std::vector<std::string>{"conflict"});
+  CHECK(st.staged.empty());
+  CHECK(st.modified.empty());
+  CHECK_FALSE(st.clean);
+}
+
+TEST_CASE("real git: upstream with ahead/behind, a detached HEAD, and branches that are real branches only") {
+  if (!haveGit()) return;
+  ParseRepo r("upstream");
+  RealGit rg{r.home, {}, {}};
+  GitOps git([&](const std::string& c, const CommandOptions& o) { return rg.run(c, o); });
+  r.write("f", "1");
+  r.g({"add", "-A"});
+  r.g({"commit", "-q", "-m", "one"});
+  r.g({"branch", "feat/x"});
+  r.g({"branch", "topic"});
+  r.g({"remote", "add", "origin", r.repo});
+  r.g({"fetch", "-q", "origin"});
+  r.g({"branch", "--set-upstream-to=origin/main", "main"});
+  r.write("f", "2");
+  r.g({"commit", "-qam", "two"});
+  GitStatus st = git.status(r.repo);
+  CHECK(st.branch == "main");
+  CHECK(st.upstream.value_or("") == "origin/main");
+  CHECK(st.ahead == 1);
+  CHECK(st.behind == 0);
+  auto bs = git.branches(r.repo);
+  std::vector<std::string> names;
+  const GitBranch* mainB = nullptr;
+  for (const auto& b : bs) {
+    names.push_back(b.name);
+    if (b.name == "main") mainB = &b;
+  }
+  CHECK(sortedCopy(names) == sortedCopy({"feat/x", "main", "topic"}));
+  REQUIRE(mainB != nullptr);
+  CHECK(mainB->current);
+  CHECK(mainB->upstream.value_or("") == "origin/main");
+  r.g({"checkout", "-q", "--detach", "HEAD~1"});
+  st = git.status(r.repo);
+  CHECK(st.detached);
+  CHECK(st.branch.empty());
+  for (const auto& b : git.branches(r.repo)) {
+    CHECK(b.name.rfind('(', 0) != 0);  // no "(HEAD detached at ...)" pseudo-branch
+    CHECK_FALSE(b.current);            // nothing is current on a detached HEAD
+  }
+}
+
+TEST_CASE("real git: log keeps the subject and the body") {
+  if (!haveGit()) return;
+  ParseRepo r("log");
+  RealGit rg{r.home, {}, {}};
+  GitOps git([&](const std::string& c, const CommandOptions& o) { return rg.run(c, o); });
+  r.write("f", "1");
+  r.g({"add", "-A"});
+  r.g({"commit", "-q", "-m", "subject line", "-m", "body paragraph 1\nsecond line", "-m", "paragraph 2"});
+  r.write("f", "2");
+  r.g({"commit", "-qam", "plain"});
+  auto log = git.log(GitLogOptions{r.repo, std::nullopt});
+  REQUIRE(log.size() == 2);
+  CHECK(log[0].message == "plain");
+  CHECK(log[0].body == "");
+  CHECK(log[1].message == "subject line");
+  CHECK(log[1].body == "body paragraph 1\nsecond line\n\nparagraph 2");
+  CHECK(git.log(GitLogOptions{r.repo, 1}).size() == 1);
 }
