@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.1
+
+### Fixed
+- **An undecodable `stdoutBase64` / `stderrBase64` on a `/exec` answer no longer empties `stdoutBytes` / `stderrBytes`.** The lenient base64 decoder skipped stray characters and returned garbage or nothing; the bytes now fall back to the text's bytes, as the Go and Rust SDKs do. The gateway only sends these fields for output that is not valid UTF-8, so a well-formed answer was never affected.
+
+### Documented
+- **`files.write` creates a missing parent directory** (checked live on staging: writing `/tmp/no-such-dir/deeper/a.txt` succeeds and reads back). It does not throw; the SDK reference said it did. The header comment now says so.
+
+### Tests
+- Added for the retest: exact stdout and stderr bytes over the live connection (kept apart from each other); the `/exec` answer's bytes (base64 per stream, the text as the fallback, a bad base64 falls back per stream); every refusal before git runs (option-like ref, remote and branch, a credential with a line break) throws and sends nothing. `detail::parseCommandResult` is exposed in `client.hpp` so the `/exec` parsing can be tested without a server.
+
+### Upgrading from 0.4 (behaviour changes since 0.5.0 that can break callers)
+- **`stdout_` / `stderr_` are UTF-8 text** decoded over the whole stream (invalid bytes become U+FFFD). They used to be the raw bytes on the live connection; read `stdoutBytes` / `stderrBytes` for the exact bytes.
+- **A deadline that fires below the guest is a result, not an error** (`exitCode -1`, `timedOut`); code that caught the `400 ExecTimeout` or `502 ... i/o timeout` gateway error no longer sees it.
+- **A command that cannot start is `ActionError` with `method "cmd.start"` and `code "ExecFailed"`** on both routes; `/exec` used to throw a `GatewayError` for it.
+- **A command that needs the live connection opens it by itself** (`env`, `user`, callbacks, a cancel token or `background`); it used to throw "Not connected".
+- **`user` is validated before any transport is chosen** (`ValidationError`), and `args` is always sent (an empty list when there are none).
+- `Git.status`, `branches` and `log` parse differently since 0.5/0.6 (verbatim paths, only real branches, an empty list for a repository with no commit).
+
 ## 0.5.0
 
 `commands.run` now behaves the same over the one-shot `/exec` route and the live control connection (the shared conformance rows in `tests/conformance/spec/commands.json` pin it; before this release 13 of them failed for this SDK).

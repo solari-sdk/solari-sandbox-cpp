@@ -1,3 +1,4 @@
+#include <cctype>
 #include "solari/client.hpp"
 
 #include "solari/errors.hpp"
@@ -43,7 +44,7 @@ nlohmann::json buildCreateBody(const CreateSandboxOptions& opts,
   return body;
 }
 
-static CommandResult parseCommandResult(const nlohmann::json& j) {
+CommandResult detail::parseCommandResult(const nlohmann::json& j) {
   CommandResult r;
   if (j.contains("exitCode") && j["exitCode"].is_number())
     r.exitCode = static_cast<int>(j["exitCode"].get<double>());
@@ -53,9 +54,22 @@ static CommandResult parseCommandResult(const nlohmann::json& j) {
     r.stderr_ = j["stderr"].get<std::string>();
   if (j.contains("timedOut") && j["timedOut"].is_boolean()) r.timedOut = j["timedOut"].get<bool>();
   if (j.contains("oomKilled") && j["oomKilled"].is_boolean()) r.oomKilled = j["oomKilled"].get<bool>();
-  // The gateway sends the exact bytes (base64) beside the text only when the text is lossy; prefer them.
-  r.stdoutBytes = j.contains("stdoutBase64") && j["stdoutBase64"].is_string() ? base64Decode(j["stdoutBase64"].get<std::string>()) : r.stdout_;
-  r.stderrBytes = j.contains("stderrBase64") && j["stderrBase64"].is_string() ? base64Decode(j["stderrBase64"].get<std::string>()) : r.stderr_;
+  // The gateway sends the exact bytes (base64) beside the text only when the text is lossy; prefer them. A base64 that does not
+  // decode (the lenient base64Decode would skip stray characters and return garbage or nothing) falls back to the text's bytes,
+  // as the Go and Rust SDKs do.
+  auto exact = [&](const char* key, const std::string& text) {
+    if (j.contains(key) && j[key].is_string()) {
+      const std::string b = j[key].get<std::string>();
+      bool ok = !b.empty() && b.size() % 4 == 0;
+      for (unsigned char c : b) {
+        if (!(std::isalnum(c) || c == '+' || c == '/' || c == '=')) ok = false;
+      }
+      if (ok) return base64Decode(b);
+    }
+    return text;
+  };
+  r.stdoutBytes = exact("stdoutBase64", r.stdout_);
+  r.stderrBytes = exact("stderrBase64", r.stderr_);
   return r;
 }
 
@@ -78,7 +92,7 @@ SessionHooks Client::makeHooks() {
     if (req.timeoutMs) body["timeoutMs"] = *req.timeoutMs;
     nlohmann::json r = http->request(
         "POST", "/sandboxes/" + encodeURIComponent(id) + "/exec", body);
-    return parseCommandResult(r);
+    return detail::parseCommandResult(r);
   };
   hooks.kill = [http](const std::string& id) {
     http->request("DELETE", "/sandboxes/" + encodeURIComponent(id));
