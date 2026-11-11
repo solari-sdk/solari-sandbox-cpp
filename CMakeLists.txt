@@ -63,6 +63,8 @@ if(SOLARI_WITH_WS)
   target_compile_definitions(solari PUBLIC SOLARI_WITH_WS=1)
 endif()
 
+# doctest 2.4.11 declares cmake_minimum_required below 3.5, which CMake 4 refuses. This minimum applies to its project only
+# (it is a variable CMake before 4.0 ignores), so a default configure works on CMake 3 and 4 without the caller passing it.
 # --- tests (doctest, offline) -----------------------------------------------
 if(SOLARI_BUILD_TESTS)
   FetchContent_Declare(
@@ -70,7 +72,9 @@ if(SOLARI_BUILD_TESTS)
     URL https://github.com/doctest/doctest/archive/refs/tags/v2.4.11.tar.gz
     URL_HASH SHA256=632ed2c05a7f53fa961381497bf8069093f0d6628c5f26286161fbd32a560186
   )
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
   FetchContent_MakeAvailable(doctest)
+  unset(CMAKE_POLICY_VERSION_MINIMUM)
 
   add_executable(solari_tests tests/test_conformance.cpp tests/test_main.cpp tests/test_contract_wire.cpp tests/test_start.cpp tests/test_empty_post.cpp tests/test_git_real.cpp tests/test_concurrency.cpp tests/test_redact.cpp)
   target_link_libraries(solari_tests PRIVATE solari doctest::doctest)
@@ -103,7 +107,9 @@ if(SOLARI_BUILD_LIVE_TESTS)
       URL https://github.com/doctest/doctest/archive/refs/tags/v2.4.11.tar.gz
       URL_HASH SHA256=632ed2c05a7f53fa961381497bf8069093f0d6628c5f26286161fbd32a560186
     )
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
     FetchContent_MakeAvailable(doctest)
+    unset(CMAKE_POLICY_VERSION_MINIMUM)
   endif()
   add_executable(solari_live_tests tests/test_live.cpp)
   target_link_libraries(solari_live_tests PRIVATE solari doctest::doctest)
