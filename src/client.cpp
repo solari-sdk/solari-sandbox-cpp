@@ -98,7 +98,9 @@ SessionHooks Client::makeHooks() {
     http->request("DELETE", "/sandboxes/" + encodeURIComponent(id));
   };
   hooks.pause = [http](const std::string& id) {
-    http->request("POST", "/sandboxes/" + encodeURIComponent(id) + "/pause");
+    // Pause is idempotent on the gateway (an already-paused sandbox answers 200). The key is what makes the transport retry a POST
+    // at all, so a retryable 503 PauseRetryable (the host cut the pause short and left the sandbox running) is retried.
+    http->request("POST", "/sandboxes/" + encodeURIComponent(id) + "/pause", std::nullopt, newIdempotencyKey());
   };
   hooks.resume = [http](const std::string& id) -> std::string {
     nlohmann::json r =
