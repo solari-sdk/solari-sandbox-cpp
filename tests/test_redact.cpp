@@ -85,3 +85,56 @@ TEST_CASE("WS connect failure: ConnectionError text does not include the control
   CHECK(what.find("/control/") == std::string::npos);
 }
 #endif
+
+TEST_CASE("redactControlUrl stops a URL at a quote, an apostrophe, a tab or a newline, and keeps the text after it") {
+  CHECK(redactControlUrl("bad \"wss://h/control/SECRETA\" end", "") == "bad \"<control url redacted>\" end");
+  CHECK(redactControlUrl("bad 'ws://h/control/SECRETB' end", "") == "bad '<control url redacted>' end");
+  CHECK(redactControlUrl("a wss://h/control/SECRETC\tb", "") == "a <control url redacted>\tb");
+  CHECK(redactControlUrl("a wss://h/control/SECRETD\nb", "") == "a <control url redacted>\nb");
+}
+
+#ifdef SOLARI_WITH_WS
+#include <ixwebsocket/IXWebSocketServer.h>
+
+// A close reason the gateway (or a proxy) writes can quote the URL too: the text the in-flight call fails with must not carry it.
+TEST_CASE("a close reason that quotes the control URL does not reach the failed call's error") {
+  int freePort = 0;
+  {
+    int ls = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    REQUIRE(::bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+    socklen_t len = sizeof(a);
+    ::getsockname(ls, reinterpret_cast<sockaddr*>(&a), &len);
+    freePort = ntohs(a.sin_port);
+    ::close(ls);
+  }
+  ix::WebSocketServer server(freePort, "127.0.0.1");
+  std::string url;
+  server.setOnClientMessageCallback([&](std::shared_ptr<ix::ConnectionState>, ix::WebSocket& ws, const ix::WebSocketMessagePtr& msg) {
+    if (msg->type == ix::WebSocketMessageType::Message) ws.close(1011, "gateway dropped " + url + " now");
+  });
+  auto res = server.listen();
+  REQUIRE(res.first);
+  server.start();
+  url = "ws://127.0.0.1:" + std::to_string(server.getPort()) + "/control/SANDBOXCRED654";
+  auto chan = std::make_shared<ControlChannel>(5000);
+  chan->setIdleCloseMs(0);
+  WsControlTransport t(url, "key", chan);
+  t.connect();
+  std::string what;
+  try {
+    chan->call("fs.stat", {{"path", "/"}});
+  } catch (const ConnectionError& e) {
+    what = e.what();
+  }
+  t.stop();
+  server.stop();
+  REQUIRE_FALSE(what.empty());
+  CHECK(what.find("SANDBOXCRED654") == std::string::npos);
+  CHECK(what.find("/control/") == std::string::npos);
+  CHECK(what.find("gateway dropped") != std::string::npos);  // the rest of the reason is kept
+}
+#endif

@@ -635,3 +635,13 @@ TEST_CASE("a fast command (exit already buffered when the handle is built) does 
   REQUIRE(h.waitFor(3000).has_value());
   CHECK(becomes([&] { return !rig.sbx.channel().connected(); }));
 }
+
+TEST_CASE("runCode without callbacks does not ask the guest to stream") {
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "code.run") return {reply(idOf(req), {{"results", json::array({{{"type", "stdout"}, {"text", "x"}}})}})};
+    return {};
+  });
+  rig.sbx.runCode("print()", {});
+  json params = rig.at(0)["params"];
+  CHECK_FALSE(params.contains("stream"));
+}
