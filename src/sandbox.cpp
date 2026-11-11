@@ -75,6 +75,8 @@ Sandbox::Sandbox(const CreateSandboxResponse& resp, SandboxConfig config)
       callTimeoutMs_(config.callTimeoutMs),
       hooks_(std::move(config.hooks)),
       channel_(std::make_shared<ControlChannel>(config.callTimeoutMs)) {
+  channel_->setIdleCloseMs(config.idleCloseMs);
+  channel_->setReconnectHook([this] { connect(); });
   // A blank id is the one bad value that survives to the wire looking almost
   // right: it builds "/sandboxes//exec" (a double slash), not an obviously
   // wrong path, so it goes unnoticed while every call the handle makes is
@@ -95,6 +97,10 @@ void Sandbox::connect() {
   auto ws = std::make_shared<WsControlTransport>(controlUrl_, apiKey_, channel_);
   ws->connect();  // blocks with retry; throws on failure
   ws_ = ws;
+  std::weak_ptr<WsControlTransport> weak = ws;
+  channel_->setIdleCloseHook([weak] {
+    if (auto t = weak.lock()) t->stopQuiet();
+  });
 #else
   throw ConnectionError(
       "This build has no WS transport (SOLARI_WITH_WS=OFF); the control channel "
@@ -234,7 +240,9 @@ CommandHandle Sandbox::startCommandTapped(
     ev.data = (f.contains("base64") && f["base64"].is_string()) ? base64Decode(f["base64"].get<std::string>()) : "";
     st->push(std::move(ev));
   });
-  channel_->onFrame("cmd.exit", cmdId, [ch, cmdId, st](const nlohmann::json& f) {
+  auto exited = std::make_shared<std::atomic<bool>>(false);
+  channel_->onFrame("cmd.exit", cmdId, [ch, cmdId, st, exited](const nlohmann::json& f) {
+    exited->store(true);
     ch->offFrame("cmd.data", cmdId);
     ch->offFrame("cmd.exit", cmdId);
     ch->offStreamClose(cmdId);
@@ -245,6 +253,15 @@ CommandHandle Sandbox::startCommandTapped(
     }
     st->push(std::move(ev));
   });
+
+  // A command that exited before its handle existed had its buffered cmd.exit replayed by the registration above, and onFrame
+  // registers a handler only after the replay: the handlers it just ran to unregister were registered afterwards and stayed.
+  // Unregister them now, or the channel counts the socket as in use for good and never idle-closes.
+  if (exited->load()) {
+    ch->offFrame("cmd.data", cmdId);
+    ch->offFrame("cmd.exit", cmdId);
+    ch->offStreamClose(cmdId);
+  }
 
   return CommandHandle(ch, cmdId, st, callTimeoutMs_);
 }

@@ -37,6 +37,10 @@ struct SessionHooks {
 struct SandboxConfig {
   std::string apiKey;
   long callTimeoutMs = 300000;
+  /** Close the control socket after this long with nothing using it (no call in flight, no running command, no open PTY or watch);
+   *  the next call reopens it by itself. An open socket counts as activity at the gateway, so one left open keeps an idle sandbox
+   *  from pausing or expiring on time. Default 3000; 0 or less disables it. */
+  long idleCloseMs = 3000;
   SessionHooks hooks;
 };
 

@@ -1,6 +1,7 @@
 #include "solari/control_channel.hpp"
 
 #include <chrono>
+#include <thread>
 #include <utility>
 
 #include "solari/errors.hpp"
@@ -13,6 +14,78 @@ static const char US = '\x1f';  // unit separator, used to key (type,streamId)
 ControlChannel::ControlChannel(long callTimeoutMs)
     : callTimeoutMs_(callTimeoutMs) {}
 
+ControlChannel::~ControlChannel() {
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    idleStop_ = true;
+    idleCv_.notify_all();
+  }
+  if (idleThread_.joinable()) {
+    if (idleThread_.get_id() == std::this_thread::get_id()) idleThread_.detach();
+    else idleThread_.join();
+  }
+}
+
+void ControlChannel::setIdleCloseMs(long ms) {
+  std::lock_guard<std::mutex> lk(mtx_);
+  idleCloseMs_ = ms;
+  armIdleLocked();
+}
+void ControlChannel::setIdleCloseHook(std::function<void()> fn) {
+  std::lock_guard<std::mutex> lk(mtx_);
+  idleCloseHook_ = std::move(fn);
+}
+void ControlChannel::setReconnectHook(std::function<void()> fn) {
+  std::lock_guard<std::mutex> lk(mtx_);
+  reconnectHook_ = std::move(fn);
+}
+
+// Nothing needs the socket: no call in flight, no command close hook, no frame handler (running command, PTY, watch).
+bool ControlChannel::inUseLocked() const {
+  if (!pending_.empty() || !streamClosers_.empty()) return true;
+  for (const auto& kv : frameHandlers_)
+    if (!kv.second.empty()) return true;
+  return false;
+}
+
+void ControlChannel::armIdle() {
+  std::lock_guard<std::mutex> lk(mtx_);
+  armIdleLocked();
+}
+
+void ControlChannel::armIdleLocked() {
+  if (idleCloseMs_ <= 0 || !connected_ || closed_ || inUseLocked()) {
+    idleArmed_ = false;
+    idleCv_.notify_all();
+    return;
+  }
+  idleDeadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(idleCloseMs_);
+  idleArmed_ = true;
+  if (!idleThread_.joinable()) idleThread_ = std::thread([this] { idleLoop(); });
+  idleCv_.notify_all();
+}
+
+void ControlChannel::idleLoop() {
+  std::unique_lock<std::mutex> lk(mtx_);
+  while (!idleStop_) {
+    if (!idleArmed_) {
+      idleCv_.wait(lk);
+      continue;
+    }
+    if (idleCv_.wait_until(lk, idleDeadline_) == std::cv_status::no_timeout) continue;  // re-armed, disarmed or stopped
+    if (idleStop_ || !idleArmed_ || std::chrono::steady_clock::now() < idleDeadline_) continue;
+    idleArmed_ = false;
+    if (!connected_ || closed_ || inUseLocked()) continue;
+    // Mark the channel not connected BEFORE the socket is closed: the socket's close is then not read as a drop.
+    connected_ = false;
+    idleClosed_ = true;
+    auto hook = idleCloseHook_;
+    lk.unlock();
+    if (hook) hook();
+    lk.lock();
+  }
+}
+
 void ControlChannel::setSend(SendFn fn) {
   std::lock_guard<std::mutex> lk(mtx_);
   send_ = std::move(fn);
@@ -21,7 +94,11 @@ void ControlChannel::setSend(SendFn fn) {
 void ControlChannel::setConnected(bool v) {
   std::lock_guard<std::mutex> lk(mtx_);
   connected_ = v;
-  if (v) closed_ = false;
+  if (v) {
+    closed_ = false;
+    idleClosed_ = false;
+  }
+  armIdleLocked();
 }
 
 bool ControlChannel::connected() const {
@@ -153,6 +230,22 @@ nlohmann::json ControlChannel::call(const std::string& method,
                                     const nlohmann::json& params, long timeoutMs,
                                     const std::string& presetId,
                                     RpcStreamHandler onStream) {
+  // The channel may have become idle once this call has returned (or failed).
+  struct Rearm {
+    ControlChannel* c;
+    ~Rearm() { c->armIdle(); }
+  } rearm{this};
+  std::function<void()> reopen;
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (idleClosed_ && !closed_ && !connected_) reopen = reconnectHook_;
+  }
+  if (reopen) reopen();  // closed for being idle, not by close() or a drop: reopen it by itself
+  return callImpl(method, params, timeoutMs, presetId, std::move(onStream));
+}
+
+nlohmann::json ControlChannel::callImpl(const std::string& method, const nlohmann::json& params, long timeoutMs,
+                                        const std::string& presetId, RpcStreamHandler onStream) {
   long tmo = timeoutMs > 0 ? timeoutMs : callTimeoutMs_;
   auto prom = std::make_shared<std::promise<nlohmann::json>>();
   auto fut = prom->get_future();
@@ -223,6 +316,7 @@ void ControlChannel::offFrame(const std::string& type, const std::string& id) {
   std::lock_guard<std::mutex> lk(mtx_);
   auto it = frameHandlers_.find(type);
   if (it != frameHandlers_.end()) it->second.erase(id);
+  armIdleLocked();
 }
 
 void ControlChannel::onStreamClose(const std::string& id, StreamCloser cb) {
@@ -244,6 +338,7 @@ void ControlChannel::onStreamClose(const std::string& id, StreamCloser cb) {
 void ControlChannel::offStreamClose(const std::string& id) {
   std::lock_guard<std::mutex> lk(mtx_);
   streamClosers_.erase(id);
+  armIdleLocked();
 }
 
 void ControlChannel::failAll(const std::string& message) {
@@ -290,6 +385,9 @@ void ControlChannel::close() {
     std::lock_guard<std::mutex> lk(mtx_);
     closed_ = true;
     connected_ = false;
+    idleClosed_ = false;
+    idleArmed_ = false;
+    idleCv_.notify_all();
   }
   failAll("Control channel closed");
 }

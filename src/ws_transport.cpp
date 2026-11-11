@@ -67,7 +67,7 @@ WsControlTransport::Attempt WsControlTransport::connectOnce(std::string& errOut)
             cv_.notify_all();
           }
         }
-        if (wasOpen) chan->onClose(msg->closeInfo.code, redactControlUrl(msg->closeInfo.reason, url_));
+        if (wasOpen && !quiet_) chan->onClose(msg->closeInfo.code, redactControlUrl(msg->closeInfo.reason, url_));
         break;
       }
       default:
@@ -112,6 +112,11 @@ void WsControlTransport::connect() {
     }
   }
   throw ConnectionError(lastErr);
+}
+
+void WsControlTransport::stopQuiet() {
+  quiet_ = true;
+  stop();
 }
 
 void WsControlTransport::stop() {

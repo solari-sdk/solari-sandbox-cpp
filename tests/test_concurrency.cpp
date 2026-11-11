@@ -565,11 +565,73 @@ TEST_CASE("a command that exits before its handle exists leaves no close hook, s
   // handlers, or it is registered after that unregister and leaks (retest B-N1 / C4).
   Rig rig([](const json& req) -> std::vector<std::string> {
     if (req["method"] == "cmd.start")
-      return {reply(idOf(req), {{"cmdId", "c1"}}) + R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n"};
+      return {R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n" + reply(idOf(req), {{"cmdId", "c1"}})};
     return {};
   });
   CommandHandle h = rig.sbx.commands.start("true", {});
   auto code = h.waitFor(3000);
   REQUIRE(code.has_value());
   CHECK(rig.sbx.channel().streamCloserCount() == 0);
+}
+
+// --- idle close (retest C-17) -------------------------------------------------------------------------------------------------
+// An open control socket counts as activity at the gateway, so one left open keeps an idle sandbox from pausing or expiring on time.
+// The channel closes the socket after idleCloseMs with nothing using it and reopens it by itself on the next call.
+
+static bool becomes(const std::function<bool()>& cond, std::chrono::milliseconds d = 3000ms) {
+  auto end = std::chrono::steady_clock::now() + d;
+  while (std::chrono::steady_clock::now() < end) {
+    if (cond()) return true;
+    std::this_thread::sleep_for(10ms);
+  }
+  return cond();
+}
+
+TEST_CASE("an idle control socket is closed, and the next call reopens it") {
+  ControlChannel ch;
+  std::atomic<int> closes{0}, reopens{0};
+  ch.setSend([&](const std::string& line) {
+    json req = json::parse(line);
+    std::string id = req["id"].get<std::string>();
+    std::thread([&ch, id] { ch.onMessage(reply(id, {{"ok", true}})); }).detach();
+  });
+  ch.setIdleCloseHook([&] { closes++; });
+  ch.setReconnectHook([&] {
+    reopens++;
+    ch.setConnected(true);
+  });
+  ch.setIdleCloseMs(150);
+  ch.setConnected(true);
+  ch.call("fs.stat", {{"path", "/"}});
+  CHECK(becomes([&] { return closes.load() == 1; }));
+  CHECK_FALSE(ch.connected());
+  ch.call("fs.stat", {{"path", "/"}});  // reopens by itself
+  CHECK(reopens.load() == 1);
+  CHECK(becomes([&] { return closes.load() == 2; }));
+}
+
+TEST_CASE("a running command keeps the socket open, and it closes after the command ends") {
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "cmd.start") return {reply(idOf(req), {{"cmdId", "c1"}})};
+    return {};
+  });
+  rig.sbx.channel().setIdleCloseMs(150);
+  CommandHandle h = rig.sbx.commands.start("sleep", {});
+  std::this_thread::sleep_for(700ms);  // several idle windows
+  CHECK(rig.sbx.channel().connected());
+  rig.sbx.channel().onMessage(R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n");
+  REQUIRE(h.waitFor(3000).has_value());
+  CHECK(becomes([&] { return !rig.sbx.channel().connected(); }));
+}
+
+TEST_CASE("a fast command (exit already buffered when the handle is built) does not keep the socket open") {
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "cmd.start")
+      return {R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n" + reply(idOf(req), {{"cmdId", "c1"}})};
+    return {};
+  });
+  rig.sbx.channel().setIdleCloseMs(150);
+  CommandHandle h = rig.sbx.commands.start("true", {});
+  REQUIRE(h.waitFor(3000).has_value());
+  CHECK(becomes([&] { return !rig.sbx.channel().connected(); }));
 }
