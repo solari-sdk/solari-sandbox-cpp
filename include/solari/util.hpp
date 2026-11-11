@@ -22,6 +22,14 @@ std::string base64Decode(const std::string& b64);
 std::string encodeURIComponent(const std::string& s);
 
 /**
+ * Strip control-channel credentials from an error text before it reaches the caller. The control URL ("wss://host/control/<sandbox
+ * id>") carries the sandbox's session credential, and the WebSocket library quotes it in its connect errors ("... got 404 status
+ * connecting to wss://..."). Replaces every occurrence of `url` (when non-empty) and then any ws:// or wss:// URL still in the text
+ * with "<control url redacted>".
+ */
+std::string redactControlUrl(const std::string& msg, const std::string& url = std::string());
+
+/**
  * Make a byte string valid UTF-8: every invalid or truncated sequence becomes one U+FFFD (the maximal-subpart rule of the WHATWG
  * decoder, as Rust's `String::from_utf8_lossy` and JavaScript's TextDecoder do), NUL and valid sequences are kept. Applied to a whole
  * stream, so a character split across two output chunks survives.

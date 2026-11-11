@@ -12,6 +12,7 @@
 // unit-tested with no socket (feed byte chunks directly). The IXWebSocket wiring
 // lives in ws_transport.cpp and simply plugs setSend()/onMessage()/onClose().
 #pragma once
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -21,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <nlohmann/json.hpp>
 
@@ -38,6 +40,19 @@ class ControlChannel {
   using SendFn = std::function<void(const std::string&)>;
 
   explicit ControlChannel(long callTimeoutMs = 300000);
+  ~ControlChannel();
+
+  // --- idle close -----------------------------------------------------------
+  // An open control socket counts as activity at the gateway (it pushes the idle deadline out every 60 s), so a socket left
+  // open keeps an idle sandbox from pausing or expiring on time. With nothing using the channel (no call in flight, no
+  // running command, no open PTY or watch) for `ms`, the channel calls the idle-close hook (which closes the socket quietly)
+  // and the next call() reopens it through the reconnect hook. 0 or less disables it. Default 3000, as in the TS and Python SDKs.
+  void setIdleCloseMs(long ms);
+  long idleCloseMs() const;
+  /** Closes the socket WITHOUT reporting a drop (the channel has already marked itself not connected). */
+  void setIdleCloseHook(std::function<void()> fn);
+  /** Reopens the socket after an idle close; called by call() on the calling thread. */
+  void setReconnectHook(std::function<void()> fn);
 
   // --- transport wiring (set by the WS adapter or tests) --------------------
   void setSend(SendFn fn);
@@ -76,6 +91,9 @@ class ControlChannel {
 
   // --- stream close callbacks (frame-based waits, e.g. commands.run) --------
   void onStreamClose(const std::string& id, StreamCloser cb);
+  /** How many stream-close hooks are registered (one per live command/PTY/watch handle). A hook that outlives its stream makes the
+   *  channel count the socket as in use; exposed so a test can assert none leaks. */
+  std::size_t streamCloserCount() const;
   void offStreamClose(const std::string& id);
 
  private:
@@ -84,8 +102,14 @@ class ControlChannel {
     std::string method;
   };
 
+  nlohmann::json callImpl(const std::string& method, const nlohmann::json& params, long timeoutMs, const std::string& presetId,
+                          RpcStreamHandler onStream);
   void dispatch(const std::string& line);
   void failAll(const std::string& message);
+  bool inUseLocked() const;
+  void armIdle();  // takes mtx_
+  void armIdleLocked();
+  void idleLoop();
 
   mutable std::mutex mtx_;
   SendFn send_;
@@ -105,6 +129,17 @@ class ControlChannel {
   std::size_t orphanCount_ = 0;
   static constexpr std::size_t kMaxOrphanFrames = 1024;
   std::map<std::string, StreamCloser> streamClosers_;
+
+  // idle close
+  long idleCloseMs_ = 3000;
+  bool idleClosed_ = false;  // closed by the idle timer, not by close() or a drop: call() reopens it
+  bool idleArmed_ = false;
+  bool idleStop_ = false;
+  std::chrono::steady_clock::time_point idleDeadline_;
+  std::condition_variable idleCv_;
+  std::thread idleThread_;
+  std::function<void()> idleCloseHook_;
+  std::function<void()> reconnectHook_;
 };
 
 } // namespace solari

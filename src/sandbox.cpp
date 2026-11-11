@@ -75,6 +75,8 @@ Sandbox::Sandbox(const CreateSandboxResponse& resp, SandboxConfig config)
       callTimeoutMs_(config.callTimeoutMs),
       hooks_(std::move(config.hooks)),
       channel_(std::make_shared<ControlChannel>(config.callTimeoutMs)) {
+  channel_->setIdleCloseMs(config.idleCloseMs);
+  channel_->setReconnectHook([this] { connect(); });
   // A blank id is the one bad value that survives to the wire looking almost
   // right: it builds "/sandboxes//exec" (a double slash), not an obviously
   // wrong path, so it goes unnoticed while every call the handle makes is
@@ -95,6 +97,10 @@ void Sandbox::connect() {
   auto ws = std::make_shared<WsControlTransport>(controlUrl_, apiKey_, channel_);
   ws->connect();  // blocks with retry; throws on failure
   ws_ = ws;
+  std::weak_ptr<WsControlTransport> weak = ws;
+  channel_->setIdleCloseHook([weak] {
+    if (auto t = weak.lock()) t->stopQuiet();
+  });
 #else
   throw ConnectionError(
       "This build has no WS transport (SOLARI_WITH_WS=OFF); the control channel "
@@ -234,7 +240,9 @@ CommandHandle Sandbox::startCommandTapped(
     ev.data = (f.contains("base64") && f["base64"].is_string()) ? base64Decode(f["base64"].get<std::string>()) : "";
     st->push(std::move(ev));
   });
-  channel_->onFrame("cmd.exit", cmdId, [ch, cmdId, st](const nlohmann::json& f) {
+  auto exited = std::make_shared<std::atomic<bool>>(false);
+  channel_->onFrame("cmd.exit", cmdId, [ch, cmdId, st, exited](const nlohmann::json& f) {
+    exited->store(true);
     ch->offFrame("cmd.data", cmdId);
     ch->offFrame("cmd.exit", cmdId);
     ch->offStreamClose(cmdId);
@@ -245,6 +253,15 @@ CommandHandle Sandbox::startCommandTapped(
     }
     st->push(std::move(ev));
   });
+
+  // A command that exited before its handle existed had its buffered cmd.exit replayed by the registration above, and onFrame
+  // registers a handler only after the replay: the handlers it just ran to unregister were registered afterwards and stayed.
+  // Unregister them now, or the channel counts the socket as in use for good and never idle-closes.
+  if (exited->load()) {
+    ch->offFrame("cmd.data", cmdId);
+    ch->offFrame("cmd.exit", cmdId);
+    ch->offStreamClose(cmdId);
+  }
 
   return CommandHandle(ch, cmdId, st, callTimeoutMs_);
 }
@@ -441,9 +458,19 @@ RunCodeResult Sandbox::runCode(const std::string& code,
   nlohmann::json params = {{"code", code}};
   if (opts.language) params["language"] = *opts.language;
   if (opts.contextId) params["contextId"] = *opts.contextId;
+  // Live output: with a callback the request carries stream:true and a streaming guest sends v1 output frames before the
+  // result; they reach the callbacks as they arrive, and flattenCodeResult delivers only the rest of the result's text.
+  std::shared_ptr<CodeStream> stream;
+  RpcStreamHandler onStream;
+  if (opts.onStdout || opts.onStderr) {
+    params["stream"] = true;
+    stream = std::make_shared<CodeStream>(opts.onStdout, opts.onStderr);
+    onStream = [stream](const nlohmann::json& f) { stream->onFrame(f); };
+  }
   if (!opts.cancel) {
-    nlohmann::json r = channel_->call("code.run", params, timeout());
-    return flattenCodeResult(r, opts.onStdout, opts.onStderr);
+    nlohmann::json r = channel_->call("code.run", params, timeout(), "", onStream);
+    return flattenCodeResult(r, opts.onStdout, opts.onStderr, stream ? stream->stdoutSent() : std::string(),
+                             stream ? stream->stderrSent() : std::string());
   }
   // Cancellable: the call blocks, so it runs on its own thread while this one watches the token.
   struct Outcome {
@@ -456,11 +483,11 @@ RunCodeResult Sandbox::runCode(const std::string& code,
   auto outcome = std::make_shared<Outcome>();
   auto channel = channel_;
   const long callTimeout = timeout();
-  std::thread([outcome, channel, params, callTimeout] {
+  std::thread([outcome, channel, params, callTimeout, onStream] {
     nlohmann::json r;
     std::exception_ptr e;
     try {
-      r = channel->call("code.run", params, callTimeout);
+      r = channel->call("code.run", params, callTimeout, "", onStream);
     } catch (...) {
       e = std::current_exception();
     }
@@ -488,7 +515,8 @@ RunCodeResult Sandbox::runCode(const std::string& code,
     outcome->cv.wait_for(lk, std::chrono::milliseconds(50));
   }
   if (outcome->error) std::rethrow_exception(outcome->error);
-  return flattenCodeResult(outcome->result, opts.onStdout, opts.onStderr);
+  return flattenCodeResult(outcome->result, opts.onStdout, opts.onStderr, stream ? stream->stdoutSent() : std::string(),
+                           stream ? stream->stderrSent() : std::string());
 }
 
 // --- Files ------------------------------------------------------------------

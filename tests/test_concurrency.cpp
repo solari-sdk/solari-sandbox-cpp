@@ -496,3 +496,295 @@ TEST_CASE("a run with env or user on a shared sandbox reports the refusal, never
   CHECK_THROWS_AS(rig.sbx.commands.run("sh", withUser), ActionError);
   CHECK(rest.load() == 0);
 }
+
+TEST_CASE("runCode with callbacks asks the guest to stream and delivers output while the cell runs") {
+  // One rx thread, as with the real socket: it feeds the first output frame, then WAITS until the callback has seen it before it
+  // feeds the rest and the result. A character split across two frames arrives whole, and the result's complete text is not
+  // delivered a second time beyond the unflushed tail.
+  std::mutex m;
+  std::condition_variable cv;
+  std::vector<json> sent;
+  Sandbox sbx(Rig::resp(), Rig::cfg());
+  sbx.channel().setSend([&](const std::string& line) {
+    std::lock_guard<std::mutex> lk(m);
+    sent.push_back(json::parse(line));
+    cv.notify_all();
+  });
+  sbx.channel().setConnected(true);
+
+  std::string out, err;
+  bool gotFirst = false;
+  bool liveBeforeRest = false;
+  RunCodeOptions o;
+  o.onStdout = [&](const std::string& s) {
+    std::lock_guard<std::mutex> lk(m);
+    out += s;
+    gotFirst = true;
+    cv.notify_all();
+  };
+  o.onStderr = [&](const std::string& s) { err += s; };
+
+  std::thread rx([&] {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait_for(lk, 3s, [&] { return !sent.empty(); });
+    if (sent.empty()) return;
+    std::string id = sent[0]["id"].get<std::string>();
+    lk.unlock();
+    const std::string euro = "\xE2\x82\xAC";  // 3 bytes, split across two frames
+    auto frame = [&](const char* stream, const std::string& bytes) {
+      return std::string("{\"id\":\"") + id + "\",\"stream\":\"" + stream + "\",\"data\":\"" + base64Encode(bytes) + "\"}\n";
+    };
+    sbx.channel().onMessage(frame("stdout", "tick1 "));
+    sbx.channel().onMessage(frame("stdout", euro.substr(0, 2)));
+    lk.lock();
+    cv.wait_for(lk, 3s, [&] { return gotFirst; });
+    liveBeforeRest = gotFirst;  // the callback fired before the rest and the result were fed
+    lk.unlock();
+    sbx.channel().onMessage(frame("stdout", euro.substr(2)));
+    sbx.channel().onMessage(frame("stderr", "warn\n"));
+    sbx.channel().onMessage(reply(id, {{"results", json::array({{{"type", "stdout"}, {"text", "tick1 " + euro}},
+                                                                {{"type", "stderr"}, {"text", "warn\n"}},
+                                                                {{"type", "stdout"}, {"text", "tail"}}})}}));
+  });
+  RunCodeResult r = sbx.runCode("print()", o);
+  rx.join();
+  {
+    std::lock_guard<std::mutex> lk(m);
+    CHECK(sent[0]["method"] == "code.run");
+    CHECK(sent[0]["params"]["stream"] == true);
+  }
+  CHECK(liveBeforeRest);
+  CHECK(out == "tick1 \xE2\x82\xAC" "tail");
+  CHECK(err == "warn\n");
+  CHECK(r.results.size() == 3);
+}
+
+TEST_CASE("a command that exits before its handle exists leaves no close hook, so the socket can idle-close") {
+  // The cmd.exit frame rides in the same message as the cmd.start reply, so it is buffered before the handle exists. Registering
+  // the frame handlers replays it and its handler unregisters the close hook; the hook must therefore be registered BEFORE the
+  // handlers, or it is registered after that unregister and leaks (retest B-N1 / C4).
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "cmd.start")
+      return {R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n" + reply(idOf(req), {{"cmdId", "c1"}})};
+    return {};
+  });
+  CommandHandle h = rig.sbx.commands.start("true", {});
+  auto code = h.waitFor(3000);
+  REQUIRE(code.has_value());
+  CHECK(rig.sbx.channel().streamCloserCount() == 0);
+}
+
+// --- idle close (retest C-17) -------------------------------------------------------------------------------------------------
+// An open control socket counts as activity at the gateway, so one left open keeps an idle sandbox from pausing or expiring on time.
+// The channel closes the socket after idleCloseMs with nothing using it and reopens it by itself on the next call.
+
+static bool becomes(const std::function<bool()>& cond, std::chrono::milliseconds d = 3000ms) {
+  auto end = std::chrono::steady_clock::now() + d;
+  while (std::chrono::steady_clock::now() < end) {
+    if (cond()) return true;
+    std::this_thread::sleep_for(10ms);
+  }
+  return cond();
+}
+
+TEST_CASE("an idle control socket is closed, and the next call reopens it") {
+  ControlChannel ch;
+  std::atomic<int> closes{0}, reopens{0};
+  ch.setSend([&](const std::string& line) {
+    json req = json::parse(line);
+    std::string id = req["id"].get<std::string>();
+    std::thread([&ch, id] { ch.onMessage(reply(id, {{"ok", true}})); }).detach();
+  });
+  ch.setIdleCloseHook([&] { closes++; });
+  ch.setReconnectHook([&] {
+    reopens++;
+    ch.setConnected(true);
+  });
+  ch.setIdleCloseMs(150);
+  ch.setConnected(true);
+  ch.call("fs.stat", {{"path", "/"}});
+  CHECK(becomes([&] { return closes.load() == 1; }));
+  CHECK_FALSE(ch.connected());
+  ch.call("fs.stat", {{"path", "/"}});  // reopens by itself
+  CHECK(reopens.load() == 1);
+  CHECK(becomes([&] { return closes.load() == 2; }));
+}
+
+TEST_CASE("a running command keeps the socket open, and it closes after the command ends") {
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "cmd.start") return {reply(idOf(req), {{"cmdId", "c1"}})};
+    return {};
+  });
+  rig.sbx.channel().setIdleCloseMs(150);
+  CommandHandle h = rig.sbx.commands.start("sleep", {});
+  std::this_thread::sleep_for(700ms);  // several idle windows
+  CHECK(rig.sbx.channel().connected());
+  rig.sbx.channel().onMessage(R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n");
+  REQUIRE(h.waitFor(3000).has_value());
+  CHECK(becomes([&] { return !rig.sbx.channel().connected(); }));
+}
+
+TEST_CASE("a fast command (exit already buffered when the handle is built) does not keep the socket open") {
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "cmd.start")
+      return {R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n" + reply(idOf(req), {{"cmdId", "c1"}})};
+    return {};
+  });
+  rig.sbx.channel().setIdleCloseMs(150);
+  CommandHandle h = rig.sbx.commands.start("true", {});
+  REQUIRE(h.waitFor(3000).has_value());
+  CHECK(becomes([&] { return !rig.sbx.channel().connected(); }));
+}
+
+TEST_CASE("runCode without callbacks does not ask the guest to stream") {
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "code.run") return {reply(idOf(req), {{"results", json::array({{{"type", "stdout"}, {"text", "x"}}})}})};
+    return {};
+  });
+  rig.sbx.runCode("print()", {});
+  json params = rig.at(0)["params"];
+  CHECK_FALSE(params.contains("stream"));
+}
+
+// --- idle close: defaults, options, the hard cases ---------------------------------------------------------------------------
+
+TEST_CASE("the idle close defaults to 3 s, on the channel and in SandboxConfig, and 0 or a negative value disables it") {
+  ControlChannel ch;
+  CHECK(ch.idleCloseMs() == 3000);
+  SandboxConfig cfg;
+  CHECK(cfg.idleCloseMs == 3000);
+  Sandbox def(Rig::resp(), Rig::cfg());
+  CHECK(def.channel().idleCloseMs() == 3000);  // the Sandbox applies the config to its channel
+  SandboxConfig off = Rig::cfg();
+  off.idleCloseMs = -1;
+  Sandbox disabled(Rig::resp(), off);
+  CHECK(disabled.channel().idleCloseMs() <= 0);
+  // and a disabled channel never closes
+  std::atomic<int> closes{0};
+  disabled.channel().setSend([](const std::string&) {});
+  disabled.channel().setIdleCloseHook([&] { closes++; });
+  disabled.channel().setConnected(true);
+  std::this_thread::sleep_for(600ms);
+  CHECK(closes.load() == 0);
+  CHECK(disabled.channel().connected());
+  ch.setIdleCloseMs(0);
+  std::atomic<int> zeroCloses{0};
+  ch.setSend([](const std::string&) {});
+  ch.setIdleCloseHook([&] { zeroCloses++; });
+  ch.setConnected(true);
+  std::this_thread::sleep_for(600ms);
+  CHECK(zeroCloses.load() == 0);
+}
+
+TEST_CASE("a connected channel with no call closes after the default 3 s, and not before") {
+  ControlChannel ch;
+  std::atomic<int> closes{0};
+  ch.setSend([](const std::string&) {});
+  ch.setIdleCloseHook([&] { closes++; });
+  ch.setConnected(true);
+  std::this_thread::sleep_for(2300ms);
+  CHECK(closes.load() == 0);
+  CHECK(becomes([&] { return closes.load() == 1; }, 2000ms));
+}
+
+TEST_CASE("a slow call in flight keeps the socket past the idle window") {
+  ControlChannel ch;
+  std::atomic<int> closes{0};
+  ch.setSend([&](const std::string& line) {
+    std::string id = json::parse(line)["id"].get<std::string>();
+    std::thread([&ch, id] {
+      std::this_thread::sleep_for(700ms);
+      ch.onMessage(reply(id, {{"ok", true}}));
+    }).detach();
+  });
+  ch.setIdleCloseHook([&] { closes++; });
+  ch.setIdleCloseMs(200);
+  ch.setConnected(true);
+  ch.call("fs.slow", {});
+  CHECK(closes.load() == 0);
+  CHECK(ch.connected());
+}
+
+TEST_CASE("a call inside the window pushes the close back") {
+  ControlChannel ch;
+  std::atomic<int> closes{0};
+  ch.setSend([&](const std::string& line) {
+    std::string id = json::parse(line)["id"].get<std::string>();
+    std::thread([&ch, id] { ch.onMessage(reply(id, {{"ok", true}})); }).detach();
+  });
+  ch.setIdleCloseHook([&] { closes++; });
+  ch.setIdleCloseMs(600);
+  ch.setConnected(true);
+  std::this_thread::sleep_for(400ms);
+  ch.call("fs.stat", {{"path", "/"}});  // at 400 ms; the close was due at 600 ms
+  std::this_thread::sleep_for(400ms);   // 800 ms: past the original deadline, inside the new one
+  CHECK(closes.load() == 0);
+  CHECK(becomes([&] { return closes.load() == 1; }));
+}
+
+TEST_CASE("after an idle close and a reopen, a real drop is reported and the next call does not silently reopen") {
+  ControlChannel ch;
+  std::atomic<int> reopens{0};
+  ch.setSend([&](const std::string& line) {
+    std::string id = json::parse(line)["id"].get<std::string>();
+    std::thread([&ch, id] { ch.onMessage(reply(id, {{"ok", true}})); }).detach();
+  });
+  ch.setIdleCloseHook([] {});
+  ch.setReconnectHook([&] {
+    reopens++;
+    ch.setConnected(true);
+  });
+  ch.setIdleCloseMs(150);
+  ch.setConnected(true);
+  REQUIRE(becomes([&] { return !ch.connected(); }));  // idle-closed
+  ch.call("fs.stat", {{"path", "/"}});                 // reopens by itself
+  CHECK(reopens.load() == 1);
+  ch.onClose(1006, "peer went away");                  // a real drop
+  CHECK_FALSE(ch.connected());
+  CHECK_THROWS_AS(ch.call("fs.stat", {{"path", "/"}}), ConnectionError);
+  CHECK(reopens.load() == 1);
+}
+
+#ifdef SOLARI_WITH_WS
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <ixwebsocket/IXWebSocketServer.h>
+#include "solari/ws_transport.hpp"
+
+TEST_CASE("an idle close is not a drop: a frame buffered for a later handler survives it") {
+  // The gateway sends a cmd.exit for c9 at connect (no handler yet, so it is buffered). The transport is closed quietly by the idle
+  // close; if that close were reported as a drop, failAll would clear the buffered frame.
+  int freePort = 0;
+  {
+    int ls = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    REQUIRE(::bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+    socklen_t len = sizeof(a);
+    ::getsockname(ls, reinterpret_cast<sockaddr*>(&a), &len);
+    freePort = ntohs(a.sin_port);
+    ::close(ls);
+  }
+  ix::WebSocketServer server(freePort, "127.0.0.1");
+  server.setOnClientMessageCallback([](std::shared_ptr<ix::ConnectionState>, ix::WebSocket& ws, const ix::WebSocketMessagePtr& msg) {
+    if (msg->type == ix::WebSocketMessageType::Open) ws.send("{\"type\":\"cmd.exit\",\"cmdId\":\"c9\",\"exitCode\":0}\n");
+  });
+  REQUIRE(server.listen().first);
+  server.start();
+  auto chan = std::make_shared<ControlChannel>(5000);
+  WsControlTransport t("ws://127.0.0.1:" + std::to_string(freePort) + "/control/x", "key", chan);
+  chan->setIdleCloseHook([&] { t.stopQuiet(); });
+  chan->setIdleCloseMs(300);
+  t.connect();
+  REQUIRE(becomes([&] { return !chan->connected(); }));
+  std::this_thread::sleep_for(500ms);  // the transport's close events have run
+  std::atomic<int> replayed{0};
+  chan->onFrame("cmd.exit", "c9", [&](const json&) { replayed++; });
+  t.stop();
+  server.stop();
+  CHECK(replayed.load() == 1);
+}
+#endif

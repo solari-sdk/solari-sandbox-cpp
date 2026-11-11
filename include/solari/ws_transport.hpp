@@ -3,6 +3,7 @@
 // fully unit-tested without a socket. Compiled only when SOLARI_WITH_WS=ON.
 #pragma once
 #ifdef SOLARI_WITH_WS
+#include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,8 @@ class WsControlTransport {
    *  15s connect timeout, no retry on a full timeout). Throws on failure. */
   void connect();
   void stop();
+  /** Close the socket without telling the channel it was dropped (the channel already marked itself idle-closed). */
+  void stopQuiet();
 
  private:
   enum class Attempt { Ok, FastFail, Timeout };
@@ -36,6 +39,7 @@ class WsControlTransport {
 
   std::mutex m_;
   std::condition_variable cv_;
+  std::atomic<bool> quiet_{false};
   bool opened_ = false;
   bool failed_ = false;
   std::string errMsg_;

@@ -132,4 +132,24 @@ std::string utf8Lossy(const std::string& in) {
   return out;
 }
 
+std::string redactControlUrl(const std::string& msg, const std::string& url) {
+  static const std::string kMark = "<control url redacted>";
+  std::string out = msg;
+  if (!url.empty()) {
+    for (std::size_t at = out.find(url); at != std::string::npos; at = out.find(url, at + kMark.size()))
+      out.replace(at, url.size(), kMark);
+  }
+  // Any ws:// or wss:// URL left (the library may quote a normalised form): cut to the next whitespace or quote.
+  for (const char* scheme : {"wss://", "ws://"}) {
+    std::size_t at = 0;
+    while ((at = out.find(scheme, at)) != std::string::npos) {
+      std::size_t end = at;
+      while (end < out.size() && out[end] != ' ' && out[end] != '\t' && out[end] != '\n' && out[end] != '"' && out[end] != '\'') ++end;
+      out.replace(at, end - at, kMark);
+      at += kMark.size();
+    }
+  }
+  return out;
+}
+
 } // namespace solari
