@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "solari/errors.hpp"
+#include "solari/util.hpp"
 
 namespace solari {
 
@@ -50,7 +51,7 @@ WsControlTransport::Attempt WsControlTransport::connectOnce(std::string& errOut)
         std::lock_guard<std::mutex> lk(m_);
         if (!opened_) {
           failed_ = true;
-          errMsg_ = msg->errorInfo.reason;
+          errMsg_ = redactControlUrl(msg->errorInfo.reason, url_);
           cv_.notify_all();
         }
         break;
@@ -62,11 +63,11 @@ WsControlTransport::Attempt WsControlTransport::connectOnce(std::string& errOut)
           wasOpen = opened_;
           if (!opened_) {
             failed_ = true;
-            errMsg_ = msg->closeInfo.reason;
+            errMsg_ = redactControlUrl(msg->closeInfo.reason, url_);
             cv_.notify_all();
           }
         }
-        if (wasOpen) chan->onClose(msg->closeInfo.code, msg->closeInfo.reason);
+        if (wasOpen) chan->onClose(msg->closeInfo.code, redactControlUrl(msg->closeInfo.reason, url_));
         break;
       }
       default:
