@@ -76,6 +76,9 @@ class ControlChannel {
 
   // --- stream close callbacks (frame-based waits, e.g. commands.run) --------
   void onStreamClose(const std::string& id, StreamCloser cb);
+  /** How many stream-close hooks are registered (one per live command/PTY/watch handle). A hook that outlives its stream makes the
+   *  channel count the socket as in use; exposed so a test can assert none leaks. */
+  std::size_t streamCloserCount() const;
   void offStreamClose(const std::string& id);
 
  private:

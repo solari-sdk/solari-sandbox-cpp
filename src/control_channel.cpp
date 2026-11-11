@@ -269,6 +269,11 @@ void ControlChannel::failAll(const std::string& message) {
   for (auto& kv : closers) kv.second(err);
 }
 
+std::size_t ControlChannel::streamCloserCount() const {
+  std::lock_guard<std::mutex> lk(mtx_);
+  return streamClosers_.size();
+}
+
 void ControlChannel::onClose(int code, const std::string& reason) {
   {
     std::lock_guard<std::mutex> lk(mtx_);

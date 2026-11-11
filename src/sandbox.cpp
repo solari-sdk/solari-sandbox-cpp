@@ -441,9 +441,19 @@ RunCodeResult Sandbox::runCode(const std::string& code,
   nlohmann::json params = {{"code", code}};
   if (opts.language) params["language"] = *opts.language;
   if (opts.contextId) params["contextId"] = *opts.contextId;
+  // Live output: with a callback the request carries stream:true and a streaming guest sends v1 output frames before the
+  // result; they reach the callbacks as they arrive, and flattenCodeResult delivers only the rest of the result's text.
+  std::shared_ptr<CodeStream> stream;
+  RpcStreamHandler onStream;
+  if (opts.onStdout || opts.onStderr) {
+    params["stream"] = true;
+    stream = std::make_shared<CodeStream>(opts.onStdout, opts.onStderr);
+    onStream = [stream](const nlohmann::json& f) { stream->onFrame(f); };
+  }
   if (!opts.cancel) {
-    nlohmann::json r = channel_->call("code.run", params, timeout());
-    return flattenCodeResult(r, opts.onStdout, opts.onStderr);
+    nlohmann::json r = channel_->call("code.run", params, timeout(), "", onStream);
+    return flattenCodeResult(r, opts.onStdout, opts.onStderr, stream ? stream->stdoutSent() : std::string(),
+                             stream ? stream->stderrSent() : std::string());
   }
   // Cancellable: the call blocks, so it runs on its own thread while this one watches the token.
   struct Outcome {
@@ -456,11 +466,11 @@ RunCodeResult Sandbox::runCode(const std::string& code,
   auto outcome = std::make_shared<Outcome>();
   auto channel = channel_;
   const long callTimeout = timeout();
-  std::thread([outcome, channel, params, callTimeout] {
+  std::thread([outcome, channel, params, callTimeout, onStream] {
     nlohmann::json r;
     std::exception_ptr e;
     try {
-      r = channel->call("code.run", params, callTimeout);
+      r = channel->call("code.run", params, callTimeout, "", onStream);
     } catch (...) {
       e = std::current_exception();
     }
@@ -488,7 +498,8 @@ RunCodeResult Sandbox::runCode(const std::string& code,
     outcome->cv.wait_for(lk, std::chrono::milliseconds(50));
   }
   if (outcome->error) std::rethrow_exception(outcome->error);
-  return flattenCodeResult(outcome->result, opts.onStdout, opts.onStderr);
+  return flattenCodeResult(outcome->result, opts.onStdout, opts.onStderr, stream ? stream->stdoutSent() : std::string(),
+                           stream ? stream->stderrSent() : std::string());
 }
 
 // --- Files ------------------------------------------------------------------

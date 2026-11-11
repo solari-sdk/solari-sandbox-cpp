@@ -496,3 +496,80 @@ TEST_CASE("a run with env or user on a shared sandbox reports the refusal, never
   CHECK_THROWS_AS(rig.sbx.commands.run("sh", withUser), ActionError);
   CHECK(rest.load() == 0);
 }
+
+TEST_CASE("runCode with callbacks asks the guest to stream and delivers output while the cell runs") {
+  // One rx thread, as with the real socket: it feeds the first output frame, then WAITS until the callback has seen it before it
+  // feeds the rest and the result. A character split across two frames arrives whole, and the result's complete text is not
+  // delivered a second time beyond the unflushed tail.
+  std::mutex m;
+  std::condition_variable cv;
+  std::vector<json> sent;
+  Sandbox sbx(Rig::resp(), Rig::cfg());
+  sbx.channel().setSend([&](const std::string& line) {
+    std::lock_guard<std::mutex> lk(m);
+    sent.push_back(json::parse(line));
+    cv.notify_all();
+  });
+  sbx.channel().setConnected(true);
+
+  std::string out, err;
+  bool gotFirst = false;
+  bool liveBeforeRest = false;
+  RunCodeOptions o;
+  o.onStdout = [&](const std::string& s) {
+    std::lock_guard<std::mutex> lk(m);
+    out += s;
+    gotFirst = true;
+    cv.notify_all();
+  };
+  o.onStderr = [&](const std::string& s) { err += s; };
+
+  std::thread rx([&] {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait_for(lk, 3s, [&] { return !sent.empty(); });
+    if (sent.empty()) return;
+    std::string id = sent[0]["id"].get<std::string>();
+    lk.unlock();
+    const std::string euro = "\xE2\x82\xAC";  // 3 bytes, split across two frames
+    auto frame = [&](const char* stream, const std::string& bytes) {
+      return std::string("{\"id\":\"") + id + "\",\"stream\":\"" + stream + "\",\"data\":\"" + base64Encode(bytes) + "\"}\n";
+    };
+    sbx.channel().onMessage(frame("stdout", "tick1 "));
+    sbx.channel().onMessage(frame("stdout", euro.substr(0, 2)));
+    lk.lock();
+    cv.wait_for(lk, 3s, [&] { return gotFirst; });
+    liveBeforeRest = gotFirst;  // the callback fired before the rest and the result were fed
+    lk.unlock();
+    sbx.channel().onMessage(frame("stdout", euro.substr(2)));
+    sbx.channel().onMessage(frame("stderr", "warn\n"));
+    sbx.channel().onMessage(reply(id, {{"results", json::array({{{"type", "stdout"}, {"text", "tick1 " + euro}},
+                                                                {{"type", "stderr"}, {"text", "warn\n"}},
+                                                                {{"type", "stdout"}, {"text", "tail"}}})}}));
+  });
+  RunCodeResult r = sbx.runCode("print()", o);
+  rx.join();
+  {
+    std::lock_guard<std::mutex> lk(m);
+    CHECK(sent[0]["method"] == "code.run");
+    CHECK(sent[0]["params"]["stream"] == true);
+  }
+  CHECK(liveBeforeRest);
+  CHECK(out == "tick1 \xE2\x82\xAC" "tail");
+  CHECK(err == "warn\n");
+  CHECK(r.results.size() == 3);
+}
+
+TEST_CASE("a command that exits before its handle exists leaves no close hook, so the socket can idle-close") {
+  // The cmd.exit frame rides in the same message as the cmd.start reply, so it is buffered before the handle exists. Registering
+  // the frame handlers replays it and its handler unregisters the close hook; the hook must therefore be registered BEFORE the
+  // handlers, or it is registered after that unregister and leaks (retest B-N1 / C4).
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "cmd.start")
+      return {reply(idOf(req), {{"cmdId", "c1"}}) + R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n"};
+    return {};
+  });
+  CommandHandle h = rig.sbx.commands.start("true", {});
+  auto code = h.waitFor(3000);
+  REQUIRE(code.has_value());
+  CHECK(rig.sbx.channel().streamCloserCount() == 0);
+}
