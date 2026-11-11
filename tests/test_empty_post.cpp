@@ -26,7 +26,7 @@ namespace {
 /** Answers every request with one canned 200 and records the whole request head, lower-cased. */
 class HeadRecorder {
  public:
-  explicit HeadRecorder(std::string body) : body_(std::move(body)) {
+  explicit HeadRecorder(std::string body, std::size_t failFirst = 0) : body_(std::move(body)), failFirst_(failFirst) {
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(fd_ >= 0);
     int one = 1;
@@ -69,9 +69,19 @@ class HeadRecorder {
           std::lock_guard<std::mutex> lk(m_);
           heads_.push_back(head);
         }
-        const std::string resp =
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
-            std::to_string(body_.size()) + "\r\nConnection: close\r\n\r\n" + body_;
+        std::size_t seen;
+        {
+          std::lock_guard<std::mutex> lk(m_);
+          seen = heads_.size();
+        }
+        // The first `failFirst_` requests get a retryable 503 PauseRetryable (the host cut a pause short).
+        const std::string retryable =
+            R"({"error":"Sandbox pause did not finish; it is still running","code":"PauseRetryable","retryable":true})";
+        const bool fail = seen <= failFirst_;
+        const std::string& payload = fail ? retryable : body_;
+        const std::string resp = std::string(fail ? "HTTP/1.1 503 Service Unavailable" : "HTTP/1.1 200 OK") +
+                                 "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(payload.size()) +
+                                 "\r\nConnection: close\r\n\r\n" + payload;
         ::send(c, resp.data(), resp.size(), MSG_NOSIGNAL);
       }
       ::close(c);
@@ -79,6 +89,7 @@ class HeadRecorder {
   }
 
   std::string body_;
+  std::size_t failFirst_ = 0;
   int fd_ = -1;
   int port_ = 0;
   std::atomic<bool> stop_{false};
@@ -125,4 +136,22 @@ TEST_CASE("a GET carries no Content-Length") {
   REQUIRE(g.heads().size() == 1);
   CHECK(g.heads()[0].rfind("get /sandboxes/sbx-1 ", 0) == 0);
   CHECK_MESSAGE(g.heads()[0].find("content-length") == std::string::npos, "head was:\n" << g.heads()[0]);
+}
+
+TEST_CASE("pause retries a 503 PauseRetryable with one Idempotency-Key on every attempt") {
+  HeadRecorder g(R"({"state":"paused"})", 2);
+  Client c = clientFor(g);
+  c.pause("sbx-1");
+  const auto heads = g.heads();
+  REQUIRE(heads.size() == 3);
+  auto keyOf = [](const std::string& h) {
+    const std::string tag = "\r\nidempotency-key: ";
+    auto at = h.find(tag);
+    if (at == std::string::npos) return std::string();
+    at += tag.size();
+    return h.substr(at, h.find("\r\n", at) - at);
+  };
+  CHECK_FALSE(keyOf(heads[0]).empty());
+  CHECK(keyOf(heads[1]) == keyOf(heads[0]));
+  CHECK(keyOf(heads[2]) == keyOf(heads[0]));
 }
