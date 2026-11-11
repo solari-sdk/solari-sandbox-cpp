@@ -31,6 +31,10 @@ void ControlChannel::setIdleCloseMs(long ms) {
   idleCloseMs_ = ms;
   armIdleLocked();
 }
+long ControlChannel::idleCloseMs() const {
+  std::lock_guard<std::mutex> lk(mtx_);
+  return idleCloseMs_;
+}
 void ControlChannel::setIdleCloseHook(std::function<void()> fn) {
   std::lock_guard<std::mutex> lk(mtx_);
   idleCloseHook_ = std::move(fn);

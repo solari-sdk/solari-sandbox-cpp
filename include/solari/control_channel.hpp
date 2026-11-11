@@ -48,6 +48,7 @@ class ControlChannel {
   // running command, no open PTY or watch) for `ms`, the channel calls the idle-close hook (which closes the socket quietly)
   // and the next call() reopens it through the reconnect hook. 0 or less disables it. Default 3000, as in the TS and Python SDKs.
   void setIdleCloseMs(long ms);
+  long idleCloseMs() const;
   /** Closes the socket WITHOUT reporting a drop (the channel has already marked itself not connected). */
   void setIdleCloseHook(std::function<void()> fn);
   /** Reopens the socket after an idle close; called by call() on the calling thread. */
