@@ -211,6 +211,61 @@ TEST_CASE("callbacks have seen all output by the time wait() returns") {
   CHECK(r.stdout_ == "ab");
 }
 
+// ---- exact output bytes (retest 2026-11-10) -----------------------------------------------------------------------------
+
+TEST_CASE("stdout and stderr keep their exact bytes over the live connection, apart from each other") {
+  // stdout "\xff\x00ab", stderr "\xfe\x00!": base64 of those bytes
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "cmd.start") {
+      return {reply(idOf(req), {{"cmdId", "c1"}}),
+              R"({"type":"cmd.data","cmdId":"c1","stream":"stdout","base64":"/wBhYg=="})" "\n",
+              R"({"type":"cmd.data","cmdId":"c1","stream":"stderr","base64":"/gAh"})" "\n",
+              R"({"type":"cmd.exit","cmdId":"c1","exitCode":2})" "\n"};
+    }
+    return {reply(idOf(req), {{"ok", true}})};
+  });
+  CommandOptions o;
+  o.onStdout = [](const std::string&) {};  // a callback forces the live connection
+  CommandResult r = rig.sbx.commands.run("x", o);
+  CHECK(r.stdoutBytes == std::string("\xff\x00" "ab", 4));
+  CHECK(r.stderrBytes == std::string("\xfe\x00!", 3));
+  CHECK(r.stdout_ != r.stdoutBytes);  // the text form replaced the invalid byte
+}
+
+TEST_CASE("the /exec answer's exact bytes: base64 per stream, the text as the fallback, a bad base64 falls back") {
+  CommandResult both = detail::parseCommandResult(
+      json::parse(R"({"exitCode":1,"stdout":"\ufffd","stderr":"\ufffd","stdoutBase64":"/wD+","stderrBase64":"/w=="})"));
+  CHECK(both.stdoutBytes == std::string("\xff\x00\xfe", 3));
+  CHECK(both.stderrBytes == std::string("\xff", 1));
+  CommandResult text = detail::parseCommandResult(json::parse(R"({"exitCode":1,"stdout":"h\u00e9llo","stderr":"oops \u00e9"})"));
+  CHECK(text.stdoutBytes == "h\xc3\xa9llo");
+  CHECK(text.stderrBytes == "oops \xc3\xa9");
+  CommandResult bad = detail::parseCommandResult(
+      json::parse(R"({"exitCode":1,"stdout":"ok","stderr":"bad","stdoutBase64":"!!","stderrBase64":"!!"})"));
+  CHECK(bad.stdoutBytes == "ok");
+  CHECK(bad.stderrBytes == "bad");
+}
+
+TEST_CASE("every refusal before git runs throws, and sends nothing") {
+  Rig rig([](const json& req) -> std::vector<std::string> { return {reply(idOf(req), {{"ok", true}})}; });
+  GitCheckoutOptions co;
+  co.cwd = "/r";
+  CHECK_THROWS_AS(rig.sbx.git.checkout("--upload-pack=evil", co), Error);
+  GitRemoteOptions push;
+  push.cwd = "/r";
+  push.remote = "-evil";
+  CHECK_THROWS_AS(rig.sbx.git.push(push), Error);
+  GitRemoteOptions pull;
+  pull.cwd = "/r";
+  pull.branch = "--force";
+  CHECK_THROWS_AS(rig.sbx.git.pull(pull), Error);
+  GitCloneOptions cred;
+  cred.username = "u\nx";
+  cred.password = "p";
+  CHECK_THROWS_AS(rig.sbx.git.clone("https://h/r.git", cred), Error);
+  CHECK(rig.methods().empty());
+}
+
 // ---- files -------------------------------------------------------------------------------------------------
 
 TEST_CASE("upload sends 4 MiB chunks, truncating only the first") {

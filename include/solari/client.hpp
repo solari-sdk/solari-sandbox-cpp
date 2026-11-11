@@ -74,4 +74,10 @@ class Client {
   long callTimeoutMs_;
 };
 
+namespace detail {
+/** The `/exec` answer as a CommandResult (exposed for tests): the text beside the exact bytes. The gateway sends `stdoutBase64` /
+ *  `stderrBase64` only when the text is lossy; without one (or with an undecodable one) the bytes are the text's bytes. */
+CommandResult parseCommandResult(const nlohmann::json& j);
+}  // namespace detail
+
 } // namespace solari

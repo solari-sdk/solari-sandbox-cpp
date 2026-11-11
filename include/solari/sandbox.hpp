@@ -202,7 +202,8 @@ class Sandbox {
     explicit Files(Sandbox& s) : s_(s) {}
     std::string read(const std::string& path);      // raw bytes
     std::string readText(const std::string& path);  // == read (UTF-8)
-    /** Write in one frame. More than 32 MiB is refused before anything is sent: use upload(). */
+    /** Write in one frame. More than 32 MiB is refused before anything is sent: use upload(). A missing parent directory is
+     *  created (it does NOT throw). */
     void write(const std::string& path, const std::string& data,
                std::optional<int> mode = std::nullopt);
     /** Write in 4 MiB chunks (fs.upload); any size. An empty file is one zero-length call. */
