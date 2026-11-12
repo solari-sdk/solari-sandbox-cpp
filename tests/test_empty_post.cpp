@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <cctype>
 #include <mutex>
 #include <string>
@@ -181,4 +183,34 @@ TEST_CASE("ClientOptions.idleCloseMs is applied to the handles the client return
   o.idleCloseMs = 0;
   Client off(o);
   CHECK(off.connect("sbx-1")->channel().idleCloseMs() <= 0);
+}
+
+// The pause window is 120 s, as in TypeScript and Python (PAUSE_RETRY_WINDOW_MS).
+TEST_CASE("the pause retry window is two minutes") { CHECK(kPauseRetryWindowMs == 120000); }
+
+// The window bounds the retries: an answer that stays retryable is retried while the window is open (more than the ordinary budget
+// of 5 retries) and then the last 503 reaches the caller. Window 300 ms, 20 ms between attempts. Run on its own thread and bounded
+// at 5 s, so a window that never ended fails here instead of hanging the suite.
+TEST_CASE("a retry window ends with the last 503") {
+  auto g = std::make_shared<HeadRecorder>(R"({"state":"paused"})", static_cast<std::size_t>(-1));
+  auto t = std::make_shared<HttpTransport>("slr_test_x", g->baseUrl(), 5, 300000, 20);
+  auto done = std::make_shared<std::promise<std::string>>();
+  auto fut = done->get_future();
+  const auto start = std::chrono::steady_clock::now();
+  std::thread([t, done] {
+    try {
+      t->request("POST", "/sandboxes/sbx-1/pause", std::nullopt, std::string("k-1"), 300L);
+      done->set_value("no error");
+    } catch (const GatewayError& e) {
+      done->set_value(std::to_string(e.status) + " " + e.code.value_or(""));
+    } catch (const std::exception& e) {
+      done->set_value(std::string("other: ") + e.what());
+    }
+  }).detach();
+  REQUIRE_MESSAGE(fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "the window never ended");
+  const auto took = std::chrono::steady_clock::now() - start;
+  CHECK(fut.get() == "503 PauseRetryable");
+  CHECK(took >= std::chrono::milliseconds(300));
+  CHECK(took < std::chrono::seconds(3));
+  CHECK(g->heads().size() > 6);
 }

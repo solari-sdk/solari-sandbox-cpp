@@ -12,7 +12,7 @@
 
 ### Tests
 - `throwGatewayError dispatches on the body code first`: 400 (`ValidationError`, `ExecTimeout`, no code) is `ValidationError`; 409 `ExecInterrupted` is `ExecInterruptedError`. Red without the 400 case or the `ExecInterrupted` branch.
-- `pause retries PauseRetryable beyond the ordinary retry budget`: six 503s then 200 succeed (7 requests). Red without the window.
+- `pause retries PauseRetryable beyond the ordinary retry budget`: six 503s then 200 succeed (7 requests). Red without the window. `the pause retry window is two minutes` pins 120 s; `a retry window ends with the last 503` (a 300 ms window through `HttpTransport::request`) retries more than the ordinary budget inside the window, then throws the last 503 `PauseRetryable` just after it. Red with the window at 5 s, and with a window that never ends (bounded at 5 s, so it fails instead of hanging).
 - `ClientOptions.idleCloseMs is applied to the handles the client returns`: 1234 and 0 reach the handle's channel. Red without the option being applied.
 
 ## 0.5.2
