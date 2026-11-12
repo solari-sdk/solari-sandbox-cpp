@@ -26,6 +26,10 @@ struct PreparedRequest {
   bool hasBody = false;
 };
 
+/** How long a pause is retried after a retryable 503 (PauseRetryable): a pause takes 35-110 s on a loaded host. Same window as the
+ *  TypeScript and Python SDKs (PAUSE_RETRY_WINDOW_MS). */
+constexpr long kPauseRetryWindowMs = 120000;
+
 class HttpTransport {
  public:
   HttpTransport(std::string apiKey, std::string baseUrl, int maxRetries = 5,
@@ -46,11 +50,16 @@ class HttpTransport {
    * Perform a request with the retry/backoff/error-mapping policy. `body` unset
    * means no body. Returns the parsed JSON response (null json for empty body).
    * Throws the mapped typed error on failure.
+   *
+   * `retryWindowMs`, when set, retries a retryable failure until that long has passed since the first attempt instead of
+   * `maxRetries` times (~5 s of backoff): for calls whose server side legitimately takes a while to settle (a pause takes 35-110 s;
+   * a host that cuts it short answers a retryable 503 PauseRetryable). Only an idempotent request is retried at all.
    */
   nlohmann::json request(const std::string& method, const std::string& path,
                          const std::optional<nlohmann::json>& body = std::nullopt,
                          const std::optional<std::string>& idempotencyKey =
-                             std::nullopt);
+                             std::nullopt,
+                         std::optional<long> retryWindowMs = std::nullopt);
 
  private:
   struct RawResponse {

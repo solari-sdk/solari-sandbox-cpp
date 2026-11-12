@@ -105,6 +105,19 @@ class ValidationError : public GatewayError {
  public:
   explicit ValidationError(const std::string& msg)
       : GatewayError(400, msg, nlohmann::json{{"code", "ValidationError"}, {"error", msg}}) {}
+  /** The gateway's own HTTP 400 (a bad field, a limit exceeded; `code` says which), as the TypeScript, Python and Go SDKs map it. */
+  ValidationError(const std::string& msg, nlohmann::json body) : GatewayError(400, msg, std::move(body)) {}
+};
+
+/**
+ * HTTP 409 {code:"ExecInterrupted"} from a one-shot command (`POST /sandboxes/:id/exec`): the sandbox was parked while the command
+ * ran, so it may have partly run. Never retried and never re-run on the live connection. Not retryable as-is. A GatewayError
+ * (status 409, code "ExecInterrupted"), so `catch (const GatewayError&)` still catches it. The Rust SDK's
+ * `SolariError::ExecInterrupted`, Go's `*ExecInterruptedError`.
+ */
+class ExecInterruptedError : public GatewayError {
+ public:
+  ExecInterruptedError(const std::string& msg, nlohmann::json body) : GatewayError(409, msg, std::move(body)) {}
 };
 
 /** A control-WS RPC returned `{ok:false}`. */

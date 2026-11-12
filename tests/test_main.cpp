@@ -953,9 +953,12 @@ TEST_CASE("newIdempotencyKey looks like a v4 UUID") {
 
 // Gateway status + body code -> typed error (PROTOCOL.md section 4).
 TEST_CASE("throwGatewayError dispatches on the body code first") {
-  enum class K { Auth, Plan, Concurrency, NoCapacity, NotStopped, Plain };
+  enum class K { Auth, Plan, Concurrency, NoCapacity, NotStopped, Interrupted, Validation, Plain };
   struct C { const char* id; int status; const char* code; K kind; };
   const C cases[] = {
+      {"400-validation", 400, "ValidationError", K::Validation},
+      {"400-exec-timeout", 400, "ExecTimeout", K::Validation},
+      {"400-no-code", 400, "", K::Validation},
       {"401", 401, "Unauthorized", K::Auth},
       {"402-plan", 402, "FeatureRequiresPlan", K::Plan},
       {"402-credit", 402, "InsufficientCredit", K::Plan},
@@ -965,6 +968,7 @@ TEST_CASE("throwGatewayError dispatches on the body code first") {
       {"409-sandbox-stopped", 409, "SandboxStopped", K::Plain},
       {"409-not-stopped", 409, "NotStopped", K::NotStopped},
       {"409-start-in-progress", 409, "StartInProgress", K::NotStopped},
+      {"409-exec-interrupted", 409, "ExecInterrupted", K::Interrupted},
       {"409-host-capability-missing", 409, "HostCapabilityMissing", K::Plain},
       {"409-snapshot-not-restorable", 409, "SnapshotNotRestorable", K::Plain},
       {"410-gone", 410, "SandboxGone", K::Plain},
@@ -1002,6 +1006,8 @@ TEST_CASE("throwGatewayError dispatches on the body code first") {
       CHECK((dynamic_cast<const ConcurrencyLimitError*>(&e) != nullptr) == (c.kind == K::Concurrency));
       CHECK((dynamic_cast<const NoCapacityError*>(&e) != nullptr) == (c.kind == K::NoCapacity));
       CHECK((dynamic_cast<const SandboxNotStoppedError*>(&e) != nullptr) == (c.kind == K::NotStopped));
+      CHECK((dynamic_cast<const ExecInterruptedError*>(&e) != nullptr) == (c.kind == K::Interrupted));
+      CHECK((dynamic_cast<const ValidationError*>(&e) != nullptr) == (c.kind == K::Validation));
     }
     CHECK(threw);
   }
@@ -1033,7 +1039,7 @@ TEST_CASE("throwGatewayError maps status codes to typed errors") {
   CHECK_THROWS_AS(throwGatewayError(402, json::object()), PlanError);
   CHECK_THROWS_AS(throwGatewayError(429, json::object()), ConcurrencyLimitError);
   CHECK_THROWS_AS(throwGatewayError(503, json::object()), NoCapacityError);
-  CHECK_THROWS_AS(throwGatewayError(400, json::object()), GatewayError);
+  CHECK_THROWS_AS(throwGatewayError(400, json::object()), ValidationError);
   CHECK_THROWS_AS(throwGatewayError(404, json::object()), GatewayError);
   // body-level no_capacity
   CHECK_THROWS_AS(throwGatewayError(500, json{{"code", "no_capacity"}}),

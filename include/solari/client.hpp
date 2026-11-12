@@ -15,6 +15,11 @@ struct ClientOptions {
   std::string apiKey;
   std::string baseUrl;
   long callTimeoutMs = 300000;
+  /** Close a handle's control socket after this long with nothing using it (no call in flight, no running command, no open PTY or
+   *  watch); the next call reopens it by itself. An open socket counts as activity at the gateway, so one left open keeps an idle
+   *  sandbox from pausing or expiring on time. Default 3000; 0 or less disables it. Applied to every handle this client returns
+   *  (`create`, `createDesktop`, `connect`), as `ClientOptions.IdleCloseMs` in Go and `idle_close_ms` in Rust. */
+  long idleCloseMs = 3000;
 };
 
 /** Build the `POST /sandboxes` JSON body, omitting unset fields (public for
@@ -72,6 +77,7 @@ class Client {
   std::shared_ptr<HttpTransport> http_;
   std::string apiKey_;
   long callTimeoutMs_;
+  long idleCloseMs_;
 };
 
 namespace detail {

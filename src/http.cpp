@@ -1,5 +1,6 @@
 #include "solari/http.hpp"
 
+#include <algorithm>
 #include <curl/curl.h>
 
 #include <chrono>
@@ -125,7 +126,7 @@ HttpTransport::RawResponse HttpTransport::perform(const PreparedRequest& req) {
 
 long HttpTransport::backoffMs(int attempt) const {
   if (retryDelayMs_ >= 0) return retryDelayMs_;
-  long base = 150L << attempt;  // 150 * 2^attempt
+  long base = 150L << std::min(attempt, 20);  // 150 * 2^attempt (capped below: 8 s)
   if (base > 8000) base = 8000;
   static thread_local std::mt19937 gen(std::random_device{}());
   std::uniform_int_distribution<int> jitter(0, 249);
@@ -135,7 +136,15 @@ long HttpTransport::backoffMs(int attempt) const {
 nlohmann::json HttpTransport::request(
     const std::string& method, const std::string& path,
     const std::optional<nlohmann::json>& body,
-    const std::optional<std::string>& idempotencyKey) {
+    const std::optional<std::string>& idempotencyKey,
+    std::optional<long> retryWindowMs) {
+  const auto started = std::chrono::steady_clock::now();
+  auto mayRetry = [&](int attempt) {
+    if (retryWindowMs) {
+      return std::chrono::steady_clock::now() - started < std::chrono::milliseconds(*retryWindowMs);
+    }
+    return attempt < maxRetries_;
+  };
   const bool idempotent =
       method == "GET" || method == "DELETE" || idempotencyKey.has_value();
   const bool hasBody = body.has_value();
@@ -146,7 +155,7 @@ nlohmann::json HttpTransport::request(
   for (;;) {
     RawResponse res = perform(req);
     if (res.networkError) {
-      if (idempotent && attempt < maxRetries_) {
+      if (idempotent && mayRetry(attempt)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs(attempt++)));
         continue;
       }
@@ -175,7 +184,7 @@ nlohmann::json HttpTransport::request(
           retryableStatus || (errBody.is_object() && errBody.contains("retryable") &&
                                 errBody["retryable"].is_boolean() &&
                                 errBody["retryable"].get<bool>());
-      if (idempotent && retryable && attempt < maxRetries_) {
+      if (idempotent && retryable && mayRetry(attempt)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs(attempt++)));
         continue;
       }

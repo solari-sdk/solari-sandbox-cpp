@@ -23,6 +23,8 @@ void throwGatewayError(int status, const nlohmann::json& body) {
     code = body["code"].get<std::string>();
   }
   switch (status) {
+    case 400:
+      throw ValidationError(msg, body);
     case 401:
       throw AuthError(msg, body);
     case 402:
@@ -33,6 +35,7 @@ void throwGatewayError(int status, const nlohmann::json& body) {
       throw GatewayError(403, msg, body);
     case 409:
       if (code == "NotStopped" || code == "StartInProgress") throw SandboxNotStoppedError(msg, body);
+      if (code == "ExecInterrupted") throw ExecInterruptedError(msg, body);
       throw GatewayError(409, msg, body);
     case 429:
       if (code.empty() || code == "ConcurrencyLimitExceeded") throw ConcurrencyLimitError(msg, body);

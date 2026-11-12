@@ -74,7 +74,7 @@ CommandResult detail::parseCommandResult(const nlohmann::json& j) {
 }
 
 Client::Client(const ClientOptions& options)
-    : apiKey_(options.apiKey), callTimeoutMs_(options.callTimeoutMs) {
+    : apiKey_(options.apiKey), callTimeoutMs_(options.callTimeoutMs), idleCloseMs_(options.idleCloseMs) {
   if (options.apiKey.empty()) throw Error("Client requires an apiKey");
   if (options.baseUrl.empty()) throw Error("Client requires a baseUrl");
   http_ = std::make_shared<HttpTransport>(options.apiKey, options.baseUrl);
@@ -99,8 +99,9 @@ SessionHooks Client::makeHooks() {
   };
   hooks.pause = [http](const std::string& id) {
     // Pause is idempotent on the gateway (an already-paused sandbox answers 200). The key is what makes the transport retry a POST
-    // at all, so a retryable 503 PauseRetryable (the host cut the pause short and left the sandbox running) is retried.
-    http->request("POST", "/sandboxes/" + encodeURIComponent(id) + "/pause", std::nullopt, newIdempotencyKey());
+    // at all, so a retryable 503 PauseRetryable (the host cut the pause short and left the sandbox running) is retried, for up to
+    // kPauseRetryWindowMs: a pause takes 35-110 s on a loaded host.
+    http->request("POST", "/sandboxes/" + encodeURIComponent(id) + "/pause", std::nullopt, newIdempotencyKey(), kPauseRetryWindowMs);
   };
   hooks.resume = [http](const std::string& id) -> std::string {
     nlohmann::json r =
@@ -130,6 +131,7 @@ SandboxConfig Client::handleConfig() {
   SandboxConfig cfg;
   cfg.apiKey = apiKey_;
   cfg.callTimeoutMs = callTimeoutMs_;
+  cfg.idleCloseMs = idleCloseMs_;
   cfg.hooks = makeHooks();
   return cfg;
 }

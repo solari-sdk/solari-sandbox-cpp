@@ -155,3 +155,30 @@ TEST_CASE("pause retries a 503 PauseRetryable with one Idempotency-Key on every 
   CHECK(keyOf(heads[1]) == keyOf(heads[0]));
   CHECK(keyOf(heads[2]) == keyOf(heads[0]));
 }
+
+// More PauseRetryable answers than the transport's ordinary retry budget (5 retries): a pause takes 35-110 s on a loaded host, so
+// it is retried for a 120 s window (as in TypeScript and Python), not ~5 s. Six 503s then the 200 (~10 s of backoff). Without the
+// window the 6th 503 reached the caller.
+TEST_CASE("pause retries PauseRetryable beyond the ordinary retry budget") {
+  HeadRecorder g(R"({"state":"paused"})", 6);
+  Client c = clientFor(g);
+  CHECK_NOTHROW(c.pause("sbx-1"));
+  CHECK(g.heads().size() == 7);
+}
+
+// ClientOptions.idleCloseMs reaches every handle the client returns (Go ClientOptions.IdleCloseMs, Rust idle_close_ms). It was not
+// an option at all: a C++ handle always idle-closed after 3 s.
+TEST_CASE("ClientOptions.idleCloseMs is applied to the handles the client returns") {
+  HeadRecorder g(R"({"sandboxId":"sbx-1","kind":"sandbox","state":"running"})");
+  ClientOptions o;
+  o.apiKey = "slr_test_x";
+  o.baseUrl = g.baseUrl();
+  CHECK(o.idleCloseMs == 3000);
+  o.idleCloseMs = 1234;
+  Client c(o);
+  auto sb = c.connect("sbx-1");
+  CHECK(sb->channel().idleCloseMs() == 1234);
+  o.idleCloseMs = 0;
+  Client off(o);
+  CHECK(off.connect("sbx-1")->channel().idleCloseMs() <= 0);
+}
