@@ -144,9 +144,10 @@ All failures throw exceptions derived from `solari::Error` (which is a
 `std::runtime_error`):
 
 - `GatewayError` (with `status` / `code` / `body`) and its typed subclasses
-  `AuthError` (401), `PlanError` (402, or 403 `NotEntitled`), `ConcurrencyLimitError` (429 `ConcurrencyLimitExceeded`),
+  `ValidationError` (400: a bad field or a limit exceeded, `code` says which; also the SDK's own refusal of a bad argument), `AuthError` (401), `PlanError` (402, or 403 `NotEntitled`), `ConcurrencyLimitError` (429 `ConcurrencyLimitExceeded`),
   `NoCapacityError` (503 `NoCapacity` / `StartTimeout`), `SandboxNotStoppedError` (409 `NotStopped` / `StartInProgress` from `start()`;
-  `code` says which, `state` is the sandbox's current state when the gateway reports it); other 403/409/429/503 codes are a plain `GatewayError`
+  `code` says which, `state` is the sandbox's current state when the gateway reports it), `ExecInterruptedError` (409 `ExecInterrupted` from a
+  one-shot command: the sandbox was parked mid-run, so it may have partly run; never retried); other 403/409/429/503 codes are a plain `GatewayError`
 - `ActionError` (an RPC replied `ok:false`), `TimeoutError`, `ConnectionError`
 
 ## Testing

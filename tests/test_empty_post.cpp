@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <cctype>
 #include <mutex>
 #include <string>
@@ -154,4 +156,61 @@ TEST_CASE("pause retries a 503 PauseRetryable with one Idempotency-Key on every 
   CHECK_FALSE(keyOf(heads[0]).empty());
   CHECK(keyOf(heads[1]) == keyOf(heads[0]));
   CHECK(keyOf(heads[2]) == keyOf(heads[0]));
+}
+
+// More PauseRetryable answers than the transport's ordinary retry budget (5 retries): a pause takes 35-110 s on a loaded host, so
+// it is retried for a 120 s window (as in TypeScript and Python), not ~5 s. Six 503s then the 200 (~10 s of backoff). Without the
+// window the 6th 503 reached the caller.
+TEST_CASE("pause retries PauseRetryable beyond the ordinary retry budget") {
+  HeadRecorder g(R"({"state":"paused"})", 6);
+  Client c = clientFor(g);
+  CHECK_NOTHROW(c.pause("sbx-1"));
+  CHECK(g.heads().size() == 7);
+}
+
+// ClientOptions.idleCloseMs reaches every handle the client returns (Go ClientOptions.IdleCloseMs, Rust idle_close_ms). It was not
+// an option at all: a C++ handle always idle-closed after 3 s.
+TEST_CASE("ClientOptions.idleCloseMs is applied to the handles the client returns") {
+  HeadRecorder g(R"({"sandboxId":"sbx-1","kind":"sandbox","state":"running"})");
+  ClientOptions o;
+  o.apiKey = "slr_test_x";
+  o.baseUrl = g.baseUrl();
+  CHECK(o.idleCloseMs == 3000);
+  o.idleCloseMs = 1234;
+  Client c(o);
+  auto sb = c.connect("sbx-1");
+  CHECK(sb->channel().idleCloseMs() == 1234);
+  o.idleCloseMs = 0;
+  Client off(o);
+  CHECK(off.connect("sbx-1")->channel().idleCloseMs() <= 0);
+}
+
+// The pause window is 120 s, as in TypeScript and Python (PAUSE_RETRY_WINDOW_MS).
+TEST_CASE("the pause retry window is two minutes") { CHECK(kPauseRetryWindowMs == 120000); }
+
+// The window bounds the retries: an answer that stays retryable is retried while the window is open (more than the ordinary budget
+// of 5 retries) and then the last 503 reaches the caller. Window 300 ms, 20 ms between attempts. Run on its own thread and bounded
+// at 5 s, so a window that never ended fails here instead of hanging the suite.
+TEST_CASE("a retry window ends with the last 503") {
+  auto g = std::make_shared<HeadRecorder>(R"({"state":"paused"})", static_cast<std::size_t>(-1));
+  auto t = std::make_shared<HttpTransport>("slr_test_x", g->baseUrl(), 5, 300000, 20);
+  auto done = std::make_shared<std::promise<std::string>>();
+  auto fut = done->get_future();
+  const auto start = std::chrono::steady_clock::now();
+  std::thread([t, done] {
+    try {
+      t->request("POST", "/sandboxes/sbx-1/pause", std::nullopt, std::string("k-1"), 300L);
+      done->set_value("no error");
+    } catch (const GatewayError& e) {
+      done->set_value(std::to_string(e.status) + " " + e.code.value_or(""));
+    } catch (const std::exception& e) {
+      done->set_value(std::string("other: ") + e.what());
+    }
+  }).detach();
+  REQUIRE_MESSAGE(fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "the window never ended");
+  const auto took = std::chrono::steady_clock::now() - start;
+  CHECK(fut.get() == "503 PauseRetryable");
+  CHECK(took >= std::chrono::milliseconds(300));
+  CHECK(took < std::chrono::seconds(3));
+  CHECK(g->heads().size() > 6);
 }

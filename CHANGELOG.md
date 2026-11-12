@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.4
+
+### Added
+- **`ExecInterruptedError`: a 409 `ExecInterrupted` from a one-shot command is typed.** The sandbox was parked while the command ran (`POST /sandboxes/:id/exec`), so it may have partly run; it is never retried and never re-run on the live connection. It was a plain `GatewayError`. It is a `GatewayError` subclass (status 409, code kept), so `catch (const GatewayError&)` still catches it. Rust: `SolariError::ExecInterrupted`; Go: `*ExecInterruptedError`.
+- **A gateway 400 is `ValidationError`, as in the TypeScript, Python and Go SDKs.** It was a plain `GatewayError`; the class existed only for the SDK's own argument checks. The gateway's `code` (`ValidationError`, `ExecTimeout`, `ExecFailed`, ...) and body are kept. A `GatewayError` subclass, so existing `catch (const GatewayError&)` (including the `/exec` handling of `400 ExecTimeout` / `ExecFailed`) is unchanged.
+- **`ClientOptions::idleCloseMs`.** The control-socket idle close (default 3000 ms; 0 or less disables it) could only be set on a hand-built `SandboxConfig`; every handle a `Client` returned used 3000. It now applies to every handle from `create`, `createDesktop` and `connect`, as `ClientOptions.IdleCloseMs` in Go and `idle_close_ms` in Rust.
+
+### Fixed
+- **`pause` retries a retryable `503 PauseRetryable` for up to two minutes, not ~5 s.** A pause takes 35-110 s on a loaded host, and a host that cuts it short answers a retryable 503. The transport gave up after its five retries, so a slow pause surfaced the 503. `Client::pause` and the handle's `pause` now keep retrying, with the same `Idempotency-Key`, for `kPauseRetryWindowMs` (120 s), as the TypeScript and Python SDKs do. New optional `retryWindowMs` on `HttpTransport::request`.
+
+### Tests
+- `throwGatewayError dispatches on the body code first`: 400 (`ValidationError`, `ExecTimeout`, no code) is `ValidationError`; 409 `ExecInterrupted` is `ExecInterruptedError`. Red without the 400 case or the `ExecInterrupted` branch.
+- `pause retries PauseRetryable beyond the ordinary retry budget`: six 503s then 200 succeed (7 requests). Red without the window. `the pause retry window is two minutes` pins 120 s; `a retry window ends with the last 503` (a 300 ms window through `HttpTransport::request`) retries more than the ordinary budget inside the window, then throws the last 503 `PauseRetryable` just after it. Red with the window at 5 s, and with a window that never ends (bounded at 5 s, so it fails instead of hanging).
+- `ClientOptions.idleCloseMs is applied to the handles the client returns`: 1234 and 0 reach the handle's channel. Red without the option being applied.
+
 ## 0.5.2
 
 ### Fixed
