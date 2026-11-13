@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.5
+
+### Fixed
+- **`commands.run` refuses a `timeoutMs` above 600000 before anything is sent, on every transport.** It throws `ValidationError` (status 400) "timeoutMs must be at most 600000", as the gateway's `POST /exec` already did. A run that took the live connection (`env`, `user`, callbacks, `background`) used to start the command with the longer deadline, because that deadline is this SDK's own timer. 600000 itself still runs. Retest C-08.
+- **A plain `commands.run` with `timeoutMs` 0 (no deadline) or under 1000 runs on the live connection.** It used to go to `POST /exec`, which takes 1000 to 600000 and threw `ValidationError` "timeoutMs must be at least 1000 (one second)", while the same call with `env` ran with no deadline (confirmed on staging 2026-11-13). As in the TypeScript and Python SDKs, a deadline `/exec` cannot express now takes the live connection.
+
+### Tests
+- `test_concurrency.cpp`: above 600000 is refused on every transport with nothing sent, and exactly 600000 runs. `a plain run with timeoutMs 0 or under 1000 runs on the live connection, never POST /exec`: red without the routing change (the run threw "at least 1000" from `/exec`); an ordinary 1000 on an unconnected sandbox still takes `/exec`.
+
 ## 0.5.4
 
 ### Added
