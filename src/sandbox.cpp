@@ -304,6 +304,8 @@ static CommandResult makeResult(int code, const std::string& out, const std::str
 static void validateRunOptions(const CommandOptions& opts) {
   if (opts.timeoutMs && *opts.timeoutMs < 0)
     throw ValidationError("timeoutMs must be at least 1000 (one second), or 0 for no deadline");
+  if (opts.timeoutMs && *opts.timeoutMs > 600000)
+    throw ValidationError("timeoutMs must be at most 600000");
   if (opts.user) {
     const std::string& u = *opts.user;
     bool ok = u == "root";

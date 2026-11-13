@@ -461,6 +461,78 @@ TEST_CASE("commands.run on a connected shared sandbox falls back to REST /exec")
   CHECK_MESSAGE(starts == 1, "the refusal is remembered: cmd.start sent once");
 }
 
+// The gateway's REST route refuses a command timeout above 600000 ms (10 min). The SDK refuses it the same way before ANY transport,
+// so a run that would have taken the live connection (env, user, callbacks) is not the one place the bound is silently skipped.
+static std::string timeoutCapMessage(Rig& rig, const std::string& cmd, const CommandOptions& o) {
+  std::string msg;
+  try {
+    rig.sbx.commands.run(cmd, o);
+  } catch (const ValidationError& e) {
+    CHECK(e.status == 400);
+    msg = e.what();
+  }
+  return msg;
+}
+
+TEST_CASE("a command timeout above 600000 ms is a ValidationError on every transport, and nothing is sent") {
+  std::atomic<int> rest{0};
+  SessionHooks hooks;
+  hooks.exec = [&](const std::string&, const ExecOneShotRequest&) {
+    rest++;
+    return CommandResult{0, "", ""};
+  };
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "cmd.start") return {reply(idOf(req), {{"cmdId", "c1"}}), R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n"};
+    return {reply(idOf(req), json::object())};
+  }, hooks);
+  { // plain run-to-completion (the /exec route)
+    CommandOptions o;
+    o.timeoutMs = 600001;
+    CHECK(timeoutCapMessage(rig, "true", o) == "timeoutMs must be at most 600000");
+  }
+  { // env: needs the live connection, which accepts any timeout, so the bound would be skipped without the SDK check
+    CommandOptions o;
+    o.timeoutMs = 600001;
+    o.env = {{"A", "1"}};
+    CHECK(timeoutCapMessage(rig, "true", o) == "timeoutMs must be at most 600000");
+  }
+  { // user, and a streaming callback
+    CommandOptions o;
+    o.timeoutMs = 3600000;
+    o.user = "root";
+    CHECK(timeoutCapMessage(rig, "true", o) == "timeoutMs must be at most 600000");
+    CommandOptions p;
+    p.timeoutMs = 3600000;
+    p.onStdout = [](const std::string&) {};
+    CHECK(timeoutCapMessage(rig, "true", p) == "timeoutMs must be at most 600000");
+  }
+  CHECK_MESSAGE(rest.load() == 0, "no POST /exec for a refused run");
+  CHECK_MESSAGE(rig.methods().empty(), "no cmd.start for a refused run");
+}
+
+TEST_CASE("a command timeout of exactly 600000 ms still runs, on /exec and on the live connection") {
+  std::atomic<int> rest{0};
+  SessionHooks hooks;
+  hooks.exec = [&](const std::string&, const ExecOneShotRequest&) {
+    rest++;
+    return CommandResult{0, "", ""};
+  };
+  Rig rig([](const json& req) -> std::vector<std::string> {
+    if (req["method"] == "cmd.start") return {reply(idOf(req), {{"cmdId", "c1"}}), R"({"type":"cmd.exit","cmdId":"c1","exitCode":0})" "\n"};
+    return {reply(idOf(req), json::object())};
+  }, hooks);
+  CommandOptions plain;
+  plain.timeoutMs = 600000;
+  CHECK(rig.sbx.commands.run("true", plain).exitCode == 0);
+  CHECK_MESSAGE(rest.load() + static_cast<int>(rig.methods().size()) >= 1, "the exact bound reached a transport");
+  CommandOptions live;
+  live.timeoutMs = 600000;
+  live.env = {{"A", "1"}};
+  CHECK(rig.sbx.commands.run("true", live).exitCode == 0);
+  REQUIRE(rig.methods().size() >= 1);
+  CHECK(rig.methods().back() == "cmd.start");
+}
+
 TEST_CASE("a streaming run on a shared sandbox still reports the refusal") {
   std::atomic<int> rest{0};
   SessionHooks hooks;
