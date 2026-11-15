@@ -138,6 +138,12 @@ int main() {
 }
 ```
 
+## Command deadline
+
+`CommandOptions::timeoutMs` is the command's deadline on every route, at most 600000 (10 minutes); `0` means no deadline.
+From v0.5.5 a larger value throws `ValidationError` "timeoutMs must be at most 600000" before anything is sent, and `0` or
+a deadline under a second runs on the live connection instead of failing on `/exec`.
+
 ## Errors
 
 All failures throw exceptions derived from `solari::Error` (which is a

@@ -510,6 +510,55 @@ TEST_CASE("a command timeout above 600000 ms is a ValidationError on every trans
   CHECK_MESSAGE(rig.methods().empty(), "no cmd.start for a refused run");
 }
 
+// /exec takes 1000..600000, so a plain run with 0 (no deadline) or under a second used to be sent there and refused with 400 "timeoutMs
+// must be at least 1000", while the same call with env ran on the live connection (staging, 2026-11-13). It now takes the live connection.
+TEST_CASE("a plain run with timeoutMs 0 or under 1000 runs on the live connection, never POST /exec") {
+  for (const int t : {0, 500}) {
+    std::atomic<int> rest{0};
+    SessionHooks hooks;
+    hooks.exec = [&](const std::string&, const ExecOneShotRequest& req) -> CommandResult {
+      rest++;
+      if (req.timeoutMs && *req.timeoutMs < 1000) throw ValidationError("timeoutMs must be at least 1000 (one second)");
+      return CommandResult{0, "", ""};
+    };
+    Rig rig([](const json& req) -> std::vector<std::string> { return {reply(idOf(req), json::object())}; }, hooks);
+    // Not yet connected, so a plain run takes /exec whenever it can (the Rig marks its channel connected, which would skip /exec).
+    // The live route then opens the control socket; the Rig's control URL is port 1, so that attempt fails with ConnectionError,
+    // which is enough here: the point is which route was taken.
+    rig.sbx.channel().setConnected(false);
+    CommandOptions o;
+    o.timeoutMs = t;
+    std::string what;
+    bool validation = false;
+    try {
+      rig.sbx.commands.run("true", o);
+    } catch (const ValidationError& e) {
+      validation = true;
+      what = e.what();
+    } catch (const Error& e) {
+      what = e.what();
+    }
+    CHECK_MESSAGE(rest.load() == 0, "timeoutMs " << t << ": no POST /exec");
+    CHECK_MESSAGE(!validation, "timeoutMs " << t << ": not refused as on /exec (" << what << ")");
+    CHECK_MESSAGE(what.find("connect") != std::string::npos, "timeoutMs " << t << ": took the live connection (" << what << ")");
+  }
+  { // control: an ordinary deadline on an unconnected sandbox still takes /exec
+    std::atomic<int> rest{0};
+    SessionHooks hooks;
+    hooks.exec = [&](const std::string&, const ExecOneShotRequest&) {
+      rest++;
+      return CommandResult{0, "", ""};
+    };
+    Rig rig([](const json& req) -> std::vector<std::string> { return {reply(idOf(req), json::object())}; }, hooks);
+    rig.sbx.channel().setConnected(false);
+    CommandOptions o;
+    o.timeoutMs = 1000;
+    CHECK(rig.sbx.commands.run("true", o).exitCode == 0);
+    CHECK_MESSAGE(rest.load() == 1, "timeoutMs 1000: POST /exec");
+    CHECK(rig.methods().empty());
+  }
+}
+
 TEST_CASE("a command timeout of exactly 600000 ms still runs, on /exec and on the live connection") {
   std::atomic<int> rest{0};
   SessionHooks hooks;

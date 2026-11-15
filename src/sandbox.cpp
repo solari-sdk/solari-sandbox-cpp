@@ -330,8 +330,10 @@ CommandResult Sandbox::runCommand(const std::string& cmd,
   validateRunOptions(opts);
   // One-shot HTTP fast path: plain run-to-completion, no streaming/env/user. Falls back to WS only when /exec is unavailable.
   // (A cancellable run always takes the control-channel path: the one-shot route has no command id to signal.)
+  // /exec takes 1000..600000 only: 0 (no deadline) and a deadline under a second run on the live connection, where the deadline is
+  // this SDK's own timer, as in the TypeScript and Python SDKs. /exec used to answer them 400 "timeoutMs must be at least 1000".
   const bool restEligible = hooks_.exec && !opts.background && !opts.onStdout && !opts.onStderr && opts.env.empty() &&
-                            !opts.user && !opts.cancel;
+                            !opts.user && !opts.cancel && (!opts.timeoutMs || *opts.timeoutMs >= 1000);
   auto viaRest = [&]() {
     ExecOneShotRequest req;
     req.cmd = cmd;
