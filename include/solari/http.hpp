@@ -44,7 +44,8 @@ class HttpTransport {
   /** Build (but do not send) the request bytes. Pure — used by tests. */
   PreparedRequest prepare(const std::string& method, const std::string& path,
                           bool hasBody, const std::string& body,
-                          const std::optional<std::string>& idempotencyKey) const;
+                          const std::optional<std::string>& idempotencyKey,
+                          bool stream = false) const;
 
   /**
    * Perform a request with the retry/backoff/error-mapping policy. `body` unset
@@ -54,12 +55,18 @@ class HttpTransport {
    * `retryWindowMs`, when set, retries a retryable failure until that long has passed since the first attempt instead of
    * `maxRetries` times (~5 s of backoff): for calls whose server side legitimately takes a while to settle (a pause takes 35-110 s;
    * a host that cuts it short answers a retryable 503 PauseRetryable). Only an idempotent request is retried at all.
+   *
+   * `stream` sends `X-Solari-Stream: 1` (POST /sandboxes/:id/exec): the gateway then starts its response early, so a dropped connection
+   * (a killed process) reaches it through the load balancer and it stops the command; without the header a plain /exec abort is never
+   * heard. A streamed answer is HTTP 200 whatever happened, with leading keep-alive newlines and the real status in `httpStatus`, which
+   * is unwrapped here into the normal result or error. A gateway that ignores the header answers as before.
    */
   nlohmann::json request(const std::string& method, const std::string& path,
                          const std::optional<nlohmann::json>& body = std::nullopt,
                          const std::optional<std::string>& idempotencyKey =
                              std::nullopt,
-                         std::optional<long> retryWindowMs = std::nullopt);
+                         std::optional<long> retryWindowMs = std::nullopt,
+                         bool stream = false);
 
  private:
   struct RawResponse {

@@ -90,8 +90,9 @@ SessionHooks Client::makeHooks() {
     body["args"] = req.args;  // always present, an empty list when there are none: the same body for an empty and an absent list
     if (req.cwd) body["cwd"] = *req.cwd;
     if (req.timeoutMs) body["timeoutMs"] = *req.timeoutMs;
+    // Streamed: the gateway starts its response early, so a dropped connection stops the command (see HttpTransport::request).
     nlohmann::json r = http->request(
-        "POST", "/sandboxes/" + encodeURIComponent(id) + "/exec", body);
+        "POST", "/sandboxes/" + encodeURIComponent(id) + "/exec", body, std::nullopt, std::nullopt, true);
     return detail::parseCommandResult(r);
   };
   hooks.kill = [http](const std::string& id) {

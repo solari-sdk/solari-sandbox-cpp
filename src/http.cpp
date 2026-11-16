@@ -64,7 +64,7 @@ std::string HttpTransport::wsOrigin() const {
 PreparedRequest HttpTransport::prepare(
     const std::string& method, const std::string& path, bool hasBody,
     const std::string& body,
-    const std::optional<std::string>& idempotencyKey) const {
+    const std::optional<std::string>& idempotencyKey, bool stream) const {
   PreparedRequest r;
   r.method = method;
   r.url = baseUrl_ + path;
@@ -74,6 +74,7 @@ PreparedRequest HttpTransport::prepare(
   r.headers.push_back("Accept: application/json");
   if (hasBody) r.headers.push_back("Content-Type: application/json");
   if (idempotencyKey) r.headers.push_back("Idempotency-Key: " + *idempotencyKey);
+  if (stream) r.headers.push_back("X-Solari-Stream: 1");
   return r;
 }
 
@@ -137,7 +138,7 @@ nlohmann::json HttpTransport::request(
     const std::string& method, const std::string& path,
     const std::optional<nlohmann::json>& body,
     const std::optional<std::string>& idempotencyKey,
-    std::optional<long> retryWindowMs) {
+    std::optional<long> retryWindowMs, bool stream) {
   const auto started = std::chrono::steady_clock::now();
   auto mayRetry = [&](int attempt) {
     if (retryWindowMs) {
@@ -149,7 +150,7 @@ nlohmann::json HttpTransport::request(
       method == "GET" || method == "DELETE" || idempotencyKey.has_value();
   const bool hasBody = body.has_value();
   const std::string bodyStr = hasBody ? body->dump() : std::string();
-  PreparedRequest req = prepare(method, path, hasBody, bodyStr, idempotencyKey);
+  PreparedRequest req = prepare(method, path, hasBody, bodyStr, idempotencyKey, stream);
 
   int attempt = 0;
   for (;;) {
@@ -192,7 +193,14 @@ nlohmann::json HttpTransport::request(
     }
 
     if (res.body.empty()) return nlohmann::json();
-    return nlohmann::json::parse(res.body);
+    nlohmann::json parsed = nlohmann::json::parse(res.body);  // leading keep-alive newlines are whitespace
+    if (stream && parsed.is_object() && parsed.contains("httpStatus") && parsed["httpStatus"].is_number_integer()) {
+      // A streamed answer: HTTP 200 whatever happened; the real status is "httpStatus".
+      const int realStatus = parsed["httpStatus"].get<int>();
+      parsed.erase("httpStatus");
+      if (realStatus >= 400) throwGatewayError(realStatus, parsed);
+    }
+    return parsed;
   }
 }
 
