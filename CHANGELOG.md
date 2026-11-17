@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.6
+
+### Fixed
+- **The one-shot `/exec` sends `X-Solari-Stream: 1`, so aborting it stops the command on an HTTP/1.1 connection too.** Through the load balancer an HTTP/1.1 client's disconnect only reaches the gateway once the gateway has started its response, and a plain `/exec` sends nothing until the command ends, so on HTTP/1.1 a killed process left the command running (retest 2026-11-16, R4; the Go and TypeScript SDKs already send the header). libcurl normally negotiates HTTP/2 to the API, where an aborted request already stops the command; the header protects builds whose libcurl falls back to HTTP/1.1. The gateway then answers HTTP 200 with keep-alive newlines first and the real status in `httpStatus`, which `HttpTransport::request(..., stream=true)` unwraps into the normal result or the typed error (a streamed 400 `ExecTimeout` is still the elapsed-deadline result). A gateway that does not know the header answers as before.
+
+### Tests
+- `tests/test_exec_stream.cpp`: the header is sent on a one-shot exec and on nothing else (red without the wiring), a streamed answer is unwrapped into the result, a streamed 409 `ExecInterrupted` keeps its real type and status (red without the unwrap), a streamed 400 `ExecTimeout` is still the timed-out result (red without the unwrap).
+
 ## 0.5.5
 
 ### Fixed

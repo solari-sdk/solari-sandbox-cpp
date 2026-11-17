@@ -76,7 +76,7 @@ if(SOLARI_BUILD_TESTS)
   FetchContent_MakeAvailable(doctest)
   unset(CMAKE_POLICY_VERSION_MINIMUM)
 
-  add_executable(solari_tests tests/test_conformance.cpp tests/test_main.cpp tests/test_contract_wire.cpp tests/test_start.cpp tests/test_empty_post.cpp tests/test_git_real.cpp tests/test_concurrency.cpp tests/test_redact.cpp)
+  add_executable(solari_tests tests/test_conformance.cpp tests/test_main.cpp tests/test_contract_wire.cpp tests/test_start.cpp tests/test_empty_post.cpp tests/test_git_real.cpp tests/test_concurrency.cpp tests/test_redact.cpp tests/test_exec_stream.cpp)
   target_link_libraries(solari_tests PRIVATE solari doctest::doctest)
   # The cross-language wire contract the TS reference SDK regenerates. Passed as a
   # path because ctest's working directory is the build tree, not this one.
